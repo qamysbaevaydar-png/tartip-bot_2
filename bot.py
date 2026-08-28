@@ -331,6 +331,9 @@ async def handle_button_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     if not user or user["current_day"] != day:
         await query.edit_message_text("Бұл тапсырма ескірген немесе бұрын орындалған.")
         return
+    if db.already_checked_in_today(telegram_id):
+        await query.edit_message_text("✅ Бүгінгі тапсырманы бұрын орындадың. Келесі тапсырма ертең келеді!")
+        return
 
     streak = db.record_checkin(telegram_id, day)
     db.advance_day(telegram_id)
@@ -352,6 +355,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Рахмет! Бірақ бүгінгі тапсырма фото түрінде емес. /today арқылы тексер."
         )
+        return
+    if db.already_checked_in_today(telegram_id):
+        await update.message.reply_text("✅ Бүгінгі тапсырманы бұрын орындадың. Келесі тапсырма ертең келеді!")
         return
 
     file_id = update.message.photo[-1].file_id
@@ -381,6 +387,9 @@ async def handle_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = user["current_day"]
     task = TASKS.get(str(day))
     if not task or task["type"] != "text_reply":
+        return
+    if db.already_checked_in_today(telegram_id):
+        await update.message.reply_text("✅ Бүгінгі тапсырманы бұрын орындадың. Келесі тапсырма ертең келеді!")
         return
 
     streak = db.record_checkin(telegram_id, day, text_response=update.message.text)
