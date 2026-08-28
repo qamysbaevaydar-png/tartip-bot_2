@@ -70,6 +70,15 @@ def get_user(telegram_id: int):
     return dict(row) if row else None
 
 
+def already_checked_in_today(telegram_id: int) -> bool:
+    """Клиент бүгін тапсырманы бұрын орындады ма — қайталап есептемес үшін."""
+    from datetime import date
+    user = get_user(telegram_id)
+    if not user or not user["last_checkin_date"]:
+        return False
+    return user["last_checkin_date"] == date.today().isoformat()
+
+
 def get_all_active_users():
     conn = get_connection()
     cur = conn.cursor()
