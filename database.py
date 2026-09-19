@@ -101,6 +101,18 @@ def set_paused(telegram_id: int, paused: bool):
     conn.close()
 
 
+def delete_user(telegram_id: int):
+    """Клиентті ТОЛЫҚ ұмытады — профиль де, тапсырма тарихы да өшеді.
+    Сынау кезінде /start ағынын қайта бастан өту үшін, немесе клиент
+    'деректерімді өшір' деп сұраса қолданылады."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM habit_checkins WHERE telegram_id = ?", (telegram_id,))
+    cur.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+    conn.close()
+
+
 def reset_progress(telegram_id: int):
     conn = get_connection()
     cur = conn.cursor()
