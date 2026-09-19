@@ -104,11 +104,13 @@ async def setup_menus(application: Application):
         BotCommand("progress", "Менің прогресім"),
         BotCommand("lessons", "📚 Видео сабақтар каталогы"),
         BotCommand("support", "Көмек керек болса"),
+        BotCommand("forget", "Деректерімді толық өшіру (қайта бастау)"),
     ]
     await application.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
 
     admin_commands = default_commands + [
         BotCommand("whoami", "Өз telegram ID-іңді көру (диагностика)"),
+        BotCommand("wipe", "Клиентті толық ұмыту (/wipe id)"),
         BotCommand("admin", "👑 Админ панель"),
         BotCommand("stats", "Жалпы статистика"),
         BotCommand("problems", "Назар керек клиенттер"),
@@ -288,6 +290,31 @@ async def send_day_to_user(context: ContextTypes.DEFAULT_TYPE, user: dict):
     text = build_day_text(user, day)
     keyboard = build_day_keyboard(user["telegram_id"], day, user["category"])
     await context.bot.send_message(user["telegram_id"], text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Клиент өзін толық ұмыттыра алады — қайта /start арқылы бастан бастауға мүмкіндік береді."""
+    telegram_id = update.effective_user.id
+    user = db.get_user(telegram_id)
+    if not user:
+        await update.message.reply_text("Сен әлі тіркелмегенсің, ұмытатын дерек жоқ. /start жаз.")
+        return
+    db.delete_user(telegram_id)
+    await update.message.reply_text(
+        "🗑 Барлық деректерің өшірілді. /start арқылы қайтадан бастай аласың."
+    )
+
+
+async def wipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ: белгілі бір клиентті толық ұмыттыру (reset-тен айырмашылығы — профиль де өшеді)."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Қолдану: /wipe <telegram_id>")
+        return
+    target_id = int(context.args[0])
+    db.delete_user(target_id)
+    await update.message.reply_text(f"🗑 {target_id} толық ұмытылды (профиль де өшті).")
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -687,6 +714,8 @@ def main():
     application.add_handler(CommandHandler("support", support_command))
     application.add_handler(CommandHandler("lessons", lessons_command))
     application.add_handler(CommandHandler("whoami", whoami_command))
+    application.add_handler(CommandHandler("forget", forget_command))
+    application.add_handler(CommandHandler("wipe", wipe_command))
 
     application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^habit_"))
     application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^noop$"))
