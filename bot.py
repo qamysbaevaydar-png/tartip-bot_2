@@ -101,6 +101,7 @@ async def setup_menus(application: Application):
     default_commands = [
         BotCommand("start", "Тіркелу / қайта кіру"),
         BotCommand("today", "Бүгінгі тапсырмаларды көру"),
+        BotCommand("roadmap", "🗺 Толық 28 күндік жолыңды көру"),
         BotCommand("progress", "Менің прогресім"),
         BotCommand("lessons", "📚 Видео сабақтар каталогы"),
         BotCommand("support", "Көмек керек болса"),
@@ -197,6 +198,43 @@ async def ask_why(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASKING_WHY
 
 
+def build_roadmap_text(category_key: str) -> str:
+    """Бүкіл 28 күндік жолды бір хабарламада көрсетеді — адам не үшін не істейтінін алдын ала біледі."""
+    cat = CATEGORIES[category_key]
+    lines = [
+        f"🗺 *Сенің 28 күндік жолың — {cat['name']}*",
+        "",
+        "Күн сайын осы 3 негізгі әдетті орындайсың (бірінші 2 күнде біртіндеп үйренесің, 3-күннен бастап толық):",
+        "",
+    ]
+    for habit in cat["core_habits"]:
+        lines.append(f"• {habit['text']}")
+    lines.append("")
+    lines.append("Ал әр апта өз фокусымен ерекшеленеді:")
+    lines.append("")
+
+    week_titles = {"1": "1-апта: Диагностика + бастау", "2": "2-апта: Белсендіру",
+                   "3": "3-апта: Тұрақтылық", "4": "4-апта: Бекіту"}
+    for week_num in ["1", "2", "3", "4"]:
+        focus = cat["weekly_focus"][week_num]
+        lines.append(f"*{week_titles[week_num]}*")
+        lines.append(f"🎯 {focus['text']}")
+        lines.append(f"💡 {focus['why']}")
+        lines.append("")
+
+    lines.append("28-күннің соңында сенде — мақсатыңа жетудің дайын фундаменті болады. "
+                  "Әр күн осы жолдың бір қадамы, кездейсоқ емес.")
+    return "\n".join(lines)
+
+
+async def roadmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Алдымен /start арқылы тіркел.")
+        return
+    await update.message.reply_text(build_roadmap_text(user["category"]), parse_mode="Markdown")
+
+
 async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goal_why = update.message.text
     tg_user = update.effective_user
@@ -213,9 +251,10 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📝 Мақсат: {goal}\n"
         f"💭 Себебі: {goal_why}\n\n"
         f"Ертеңнен бастап күн сайын таңғы {DAILY_SEND_HOUR}:00-де саған тапсырмалар келеді. "
-        f"Дедлайн: кешкі {DEADLINE_HOUR}:00.\n\n"
-        f"Бүгінгі 1-күн тапсырмаларын дереу көргің келсе — /today жаз."
+        f"Дедлайн: кешкі {DEADLINE_HOUR}:00."
     )
+    await update.message.reply_text(build_roadmap_text(category), parse_mode="Markdown")
+    await update.message.reply_text("Бүгінгі 1-күн тапсырмасын дереу көргің келсе — /today жаз.")
     return ConversationHandler.END
 
 
@@ -224,12 +263,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def get_unlocked_habit_count(day: int, total_habits: int) -> int:
+    """Алғашқы күндерде әдеттерді біртіндеп ашады — бірден толық жүктемей.
+    1-күн: 1 әдет, 2-күн: 2 әдет, 3-күннен бастап: барлығы + апта фокусы."""
+    return min(day, total_habits)
+
+
 def build_day_keyboard(telegram_id: int, day: int, category_key: str):
     cat = CATEGORIES[category_key]
     completed = db.get_completed_habits_today(telegram_id, day)
     keyboard = []
 
-    for habit in cat["core_habits"]:
+    unlocked_count = get_unlocked_habit_count(day, len(cat["core_habits"]))
+    active_habits = cat["core_habits"][:unlocked_count]
+
+    for habit in active_habits:
         done = habit["id"] in completed
         label = f"✅ {habit['text']}" if done else habit["text"]
         if habit["type"] == "button":
@@ -238,11 +286,13 @@ def build_day_keyboard(telegram_id: int, day: int, category_key: str):
             status_icon = "✅" if done else "📤"
             keyboard.append([InlineKeyboardButton(f"{status_icon} {habit['text']}", callback_data="noop")])
 
-    week_num = get_week_number_str(day)
-    focus = cat["weekly_focus"][week_num]
-    focus_done = "week_focus" in completed
-    focus_label = f"✅ {focus['text']}" if focus_done else f"🎯 {focus['text']}"
-    keyboard.append([InlineKeyboardButton(focus_label, callback_data=f"habit_week_focus_{day}")])
+    # Апта фокусы тек барлық негізгі әдет ашылғаннан кейін ғана қосылады (3-күннен бастап)
+    if unlocked_count >= len(cat["core_habits"]):
+        week_num = get_week_number_str(day)
+        focus = cat["weekly_focus"][week_num]
+        focus_done = "week_focus" in completed
+        focus_label = f"✅ {focus['text']}" if focus_done else f"🎯 {focus['text']}"
+        keyboard.append([InlineKeyboardButton(focus_label, callback_data=f"habit_week_focus_{day}")])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -253,20 +303,31 @@ def build_day_text(user: dict, day: int) -> str:
     week_num = get_week_number_str(day)
     focus = cat["weekly_focus"][week_num]
 
+    unlocked_count = get_unlocked_habit_count(day, len(cat["core_habits"]))
+    active_habits = cat["core_habits"][:unlocked_count]
+
     lines = [f"📅 {day}/{TOTAL_DAYS}-күн · {week_title}", ""]
 
-    if day in WEEK_START_DAYS:
+    if day in WEEK_START_DAYS and unlocked_count >= len(cat["core_habits"]):
         lines.append("🆕 *Жаңа апта басталды!*")
         lines.append(f"🎯 Аптаның фокусы: {focus['text']}")
         lines.append(f"💡 Неге: {focus['why']}")
         lines.append("")
 
+    if unlocked_count < len(cat["core_habits"]):
+        remaining = len(cat["core_habits"]) - unlocked_count
+        lines.append(f"🔓 Ертең тағы {remaining} жаңа әдет қосылады — біртіндеп үйренеміз, асықпа.")
+        lines.append("")
+
     lines.append("*Бүгінгі негізгі әдеттер:*")
-    for habit in cat["core_habits"]:
+    for habit in active_habits:
         lines.append(f"• {habit['text']}")
         lines.append(f"  💡 {habit['why']}")
     lines.append("")
-    lines.append(f"🎯 *Апта фокусы:* {focus['text']}")
+
+    if unlocked_count >= len(cat["core_habits"]):
+        lines.append(f"🎯 *Апта фокусы:* {focus['text']}")
+
     lines.append(f"⏰ Дедлайн: {DEADLINE_HOUR}:00")
 
     return "\n".join(lines)
@@ -325,6 +386,13 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_day_to_user(context, user)
 
 
+def get_total_tasks_for_day(day: int, cat: dict) -> int:
+    """Сол күнге қанша тапсырма (ашық әдет + апта фокусы) қажет екенін есептейді."""
+    unlocked = get_unlocked_habit_count(day, len(cat["core_habits"]))
+    has_focus = unlocked >= len(cat["core_habits"])
+    return unlocked + (1 if has_focus else 0)
+
+
 async def daily_send_job(context: ContextTypes.DEFAULT_TYPE):
     users = db.get_all_active_users()
     for user in users:
@@ -344,7 +412,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         if day > TOTAL_DAYS:
             continue
         cat = CATEGORIES[user["category"]]
-        total_habits = len(cat["core_habits"]) + 1
+        total_habits = get_total_tasks_for_day(day, cat)
         completed = len(db.get_completed_habits_today(user["telegram_id"], day))
         if completed < total_habits:
             try:
@@ -364,7 +432,7 @@ async def final_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         if day > TOTAL_DAYS:
             continue
         cat = CATEGORIES[user["category"]]
-        total_habits = len(cat["core_habits"]) + 1
+        total_habits = get_total_tasks_for_day(day, cat)
         completed = len(db.get_completed_habits_today(user["telegram_id"], day))
         if completed < total_habits:
             try:
@@ -385,7 +453,7 @@ async def deadline_advance_job(context: ContextTypes.DEFAULT_TYPE):
         if day > TOTAL_DAYS:
             continue
         cat = CATEGORIES[user["category"]]
-        total_habits = len(cat["core_habits"]) + 1
+        total_habits = get_total_tasks_for_day(day, cat)
         completed = len(db.get_completed_habits_today(user["telegram_id"], day))
 
         try:
@@ -710,6 +778,7 @@ def main():
     application.add_handler(conv_handler)
 
     application.add_handler(CommandHandler("today", today_command))
+    application.add_handler(CommandHandler("roadmap", roadmap_command))
     application.add_handler(CommandHandler("progress", progress_command))
     application.add_handler(CommandHandler("support", support_command))
     application.add_handler(CommandHandler("lessons", lessons_command))
