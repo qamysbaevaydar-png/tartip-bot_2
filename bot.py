@@ -177,8 +177,16 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category_key = query.data.split("_", 1)[1]
     context.user_data["category"] = category_key
 
-    cat_name = CATEGORIES[category_key]["name"]
-    await query.edit_message_text(f"Таңдадың: {cat_name} ✅")
+    cat = CATEGORIES[category_key]
+    await query.edit_message_text(f"Таңдадың: {cat['name']} ✅")
+
+    pdf_link = cat.get("pdf_link")
+    if pdf_link:
+        await query.message.reply_text(
+            f"📄 Алдымен толық гайдыңды оқып шық — онда осы бағыттың негізгі білімі, "
+            f"чек-листі және жиі қателіктер жазылған:\n\n{pdf_link}"
+        )
+
     await query.message.reply_text("Енді танысайық — атыңды жаз:")
     return ASKING_NAME
 
@@ -444,6 +452,23 @@ async def final_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"final_reminder_job failed for {user['telegram_id']}: {e}")
 
 
+WEEKLY_REVIEW_DAYS = {7, 14, 21, 28}
+
+
+def build_weekly_review_text(day: int) -> str:
+    week_num = {7: "1", 14: "2", 21: "3", 28: "4"}[day]
+    return (
+        f"📊 *{week_num}-АПТА REVIEW*\n\n"
+        f"Бұл апта аяқталды! Қысқаша өзіңе есеп бер:\n\n"
+        f"• Бұл аптада не жақсы шықты?\n"
+        f"• Не қиын болды?\n"
+        f"• Қай әдет тұрақты болды?\n"
+        f"• Келесі аптада нені жақсартамын?\n\n"
+        f"Жауабыңды осы хабарламаға жауап ретінде жаз — өзің үшін де, "
+        f"прогресіңді түсіну үшін де пайдалы."
+    )
+
+
 async def deadline_advance_job(context: ContextTypes.DEFAULT_TYPE):
     users = db.get_all_active_users()
     for user in users:
@@ -466,6 +491,11 @@ async def deadline_advance_job(context: ContextTypes.DEFAULT_TYPE):
                     user["telegram_id"],
                     f"❌ Бүгінгі күн толық аяқталмады ({completed}/{total_habits}). "
                     f"Ештеңе етпейді, ертең жалғастырамыз — курс тоқтамайды!"
+                )
+
+            if day in WEEKLY_REVIEW_DAYS:
+                await context.bot.send_message(
+                    user["telegram_id"], build_weekly_review_text(day), parse_mode="Markdown"
                 )
         except Exception as e:
             logger.error(f"deadline_advance_job message failed for {user['telegram_id']}: {e}")
