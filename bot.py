@@ -1,3 +1,4 @@
+
 """
 TARTIP Course Bot V3 — категорияға негізделген, дедлайн жүйесімен, күнде
 бірнеше тапсырмасы бар нұсқа.
@@ -803,7 +804,7 @@ def main():
             ASKING_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_why)],
             ASKING_WHY: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_registration)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     application.add_handler(conv_handler)
 
