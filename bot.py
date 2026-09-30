@@ -1,4 +1,3 @@
-
 """
 TARTIP Course Bot V3 — категорияға негізделген, дедлайн жүйесімен, күнде
 бірнеше тапсырмасы бар нұсқа.
@@ -16,6 +15,7 @@ import logging
 import os
 import threading
 from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
@@ -46,6 +46,7 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 DAILY_SEND_HOUR = int(os.environ.get("DAILY_SEND_HOUR", "8"))
 DEADLINE_HOUR = int(os.environ.get("DEADLINE_HOUR", "22"))
 TOTAL_DAYS = 28
+ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
 ASKING_CATEGORY, ASKING_NAME, ASKING_GOAL, ASKING_WHY = range(4)
 
@@ -414,6 +415,27 @@ async def daily_send_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"daily_send_job failed for {user['telegram_id']}: {e}")
 
 
+async def midday_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """Түс кезінде жұмсақ еске салу — тек орындалмаған тапсырмасы барларға ғана жіберіледі."""
+    users = db.get_all_active_users()
+    for user in users:
+        day = user["current_day"]
+        if day > TOTAL_DAYS:
+            continue
+        cat = CATEGORIES[user["category"]]
+        total_habits = get_total_tasks_for_day(day, cat)
+        completed = len(db.get_completed_habits_today(user["telegram_id"], day))
+        if completed < total_habits:
+            try:
+                await context.bot.send_message(
+                    user["telegram_id"],
+                    f"👋 Түс болды! Бүгінгі тапсырмалардың {completed}/{total_habits} орындалды. "
+                    f"Уақыт бар кезде орында, дедлайн кешке {DEADLINE_HOUR}:00."
+                )
+            except Exception as e:
+                logger.error(f"midday_check_job failed for {user['telegram_id']}: {e}")
+
+
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     users = db.get_all_active_users()
     for user in users:
@@ -506,12 +528,12 @@ async def deadline_advance_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_habit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if query.data == "noop":
         await query.answer("Бұл тапсырманы фото/текст арқылы орында.", show_alert=True)
         return
 
+    await query.answer()
     parts = query.data.split("_")
     day = int(parts[-1])
     habit_id = "_".join(parts[1:-1])
@@ -836,11 +858,13 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_reply))
 
     job_queue = application.job_queue
-    job_queue.run_daily(daily_send_job, time=dtime(hour=DAILY_SEND_HOUR, minute=0))
+    job_queue.run_daily(daily_send_job, time=dtime(hour=DAILY_SEND_HOUR, minute=0, tzinfo=ALMATY_TZ))
+    midday_hour = DAILY_SEND_HOUR + max(1, (DEADLINE_HOUR - DAILY_SEND_HOUR) // 2)
+    job_queue.run_daily(midday_check_job, time=dtime(hour=min(midday_hour, 23), minute=0, tzinfo=ALMATY_TZ))
     reminder_hour = max(0, DEADLINE_HOUR - 2)
-    job_queue.run_daily(reminder_job, time=dtime(hour=reminder_hour, minute=0))
-    job_queue.run_daily(final_reminder_job, time=dtime(hour=max(0, DEADLINE_HOUR - 1), minute=30))
-    job_queue.run_daily(deadline_advance_job, time=dtime(hour=DEADLINE_HOUR, minute=0))
+    job_queue.run_daily(reminder_job, time=dtime(hour=reminder_hour, minute=0, tzinfo=ALMATY_TZ))
+    job_queue.run_daily(final_reminder_job, time=dtime(hour=max(0, DEADLINE_HOUR - 1), minute=30, tzinfo=ALMATY_TZ))
+    job_queue.run_daily(deadline_advance_job, time=dtime(hour=DEADLINE_HOUR, minute=0, tzinfo=ALMATY_TZ))
 
     threading.Thread(target=run_health_server, daemon=True).start()
 
