@@ -53,6 +53,13 @@ ASKING_CATEGORY, ASKING_NAME, ASKING_GOAL, ASKING_WHY = range(4)
 with open("categories.json", "r", encoding="utf-8") as f:
     CATEGORIES = json.load(f)
 
+# "Салауатты өмір салты" жеке курс емес: оның пайдалы қағидалары басқа
+# бағдарламаларға енгізілді. Негізгі таңдауда тек бес нақты бағыт қалады.
+CATEGORIES.pop("salauatty_omir", None)
+
+with open("programs.json", "r", encoding="utf-8") as f:
+    PROGRAMS = json.load(f)
+
 with open("lessons.json", "r", encoding="utf-8") as f:
     LESSONS = json.load(f)
 
@@ -80,6 +87,18 @@ def get_week_number_str(day: int) -> str:
     if day <= 21:
         return "3"
     return "4"
+
+
+def get_daily_plan(category_key: str, day: int) -> dict:
+    """28 күндік бағдарламадан дәл сол күннің нақты миссиясын қайтарады."""
+    week_index = min(max((day - 1) // 7, 0), 3)
+    day_index = (day - 1) % 7
+    return PROGRAMS[category_key]["weeks"][week_index]["days"][day_index]
+
+
+def get_week_theme(category_key: str, day: int) -> str:
+    week_index = min(max((day - 1) // 7, 0), 3)
+    return PROGRAMS[category_key]["weeks"][week_index]["theme"]
 
 
 def is_admin(telegram_id: int) -> bool:
@@ -280,71 +299,54 @@ def get_unlocked_habit_count(day: int, total_habits: int) -> int:
 
 
 def build_day_keyboard(telegram_id: int, day: int, category_key: str):
-    cat = CATEGORIES[category_key]
     completed = db.get_completed_habits_today(telegram_id, day)
-    keyboard = []
-
-    unlocked_count = get_unlocked_habit_count(day, len(cat["core_habits"]))
-    active_habits = cat["core_habits"][:unlocked_count]
-
-    for habit in active_habits:
-        done = habit["id"] in completed
-        label = f"✅ {habit['text']}" if done else habit["text"]
-        if habit["type"] == "button":
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"habit_{habit['id']}_{day}")])
-        else:
-            status_icon = "✅" if done else "📤"
-            keyboard.append([InlineKeyboardButton(f"{status_icon} {habit['text']}", callback_data="noop")])
-
-    # Апта фокусы тек барлық негізгі әдет ашылғаннан кейін ғана қосылады (3-күннен бастап)
-    if unlocked_count >= len(cat["core_habits"]):
-        week_num = get_week_number_str(day)
-        focus = cat["weekly_focus"][week_num]
-        focus_done = "week_focus" in completed
-        focus_label = f"✅ {focus['text']}" if focus_done else f"🎯 {focus['text']}"
-        keyboard.append([InlineKeyboardButton(focus_label, callback_data=f"habit_week_focus_{day}")])
-
-    return InlineKeyboardMarkup(keyboard)
+    plan = get_daily_plan(category_key, day)
+    done = "daily_plan" in completed
+    if plan["proof"] == "button":
+        primary = InlineKeyboardButton(
+            "✅ Басты миссия орындалды" if done else "✅ Орындадым деп белгіле",
+            callback_data=f"habit_daily_plan_{day}",
+        )
+    else:
+        action = "Фото жібер" if plan["proof"] == "photo" else "Қысқа жауап жаз"
+        primary = InlineKeyboardButton(
+            "✅ Есеп қабылданды" if done else f"📤 {action}",
+            callback_data="noop",
+        )
+    return InlineKeyboardMarkup([
+        [primary],
+        [InlineKeyboardButton("🛟 Жоспар бұзылса не істеймін?", callback_data=f"planhelp_{day}")],
+    ])
 
 
 def build_day_text(user: dict, day: int) -> str:
-    cat = CATEGORIES[user["category"]]
-    week_title = get_week_title(day)
-    week_num = get_week_number_str(day)
-    focus = cat["weekly_focus"][week_num]
-
-    unlocked_count = get_unlocked_habit_count(day, len(cat["core_habits"]))
-    active_habits = cat["core_habits"][:unlocked_count]
-
-    lines = [f"📅 {day}/{TOTAL_DAYS}-күн · {week_title}", ""]
-
-    if day in WEEK_START_DAYS and unlocked_count >= len(cat["core_habits"]):
-        lines.append("🆕 *Жаңа апта басталды!*")
-        lines.append(f"🎯 Аптаның фокусы: {focus['text']}")
-        lines.append(f"💡 Неге: {focus['why']}")
-        lines.append("")
-
-    if unlocked_count < len(cat["core_habits"]):
-        remaining = len(cat["core_habits"]) - unlocked_count
-        lines.append(f"🔓 Ертең тағы {remaining} жаңа әдет қосылады — біртіндеп үйренеміз, асықпа.")
-        lines.append("")
-
-    lines.append("*Бүгінгі негізгі әдеттер:*")
-    for habit in active_habits:
-        lines.append(f"• {habit['text']}")
-        lines.append(f"  💡 {habit['why']}")
-    lines.append("")
-
-    if unlocked_count >= len(cat["core_habits"]):
-        lines.append(f"🎯 *Апта фокусы:* {focus['text']}")
-
-    lines.append(f"⏰ Дедлайн: {DEADLINE_HOUR}:00")
-
+    plan = get_daily_plan(user["category"], day)
+    proof = "фото жібер" if plan["proof"] == "photo" else ("қысқа жауап жаз" if plan["proof"] == "text" else "төмендегі батырмамен белгіле")
+    lines = [
+        f"📅 *{day}/{TOTAL_DAYS}-күн* · {get_week_theme(user['category'], day)}",
+        f"\n🎯 *{plan['title']}*",
+        plan["mission"],
+        "\n*Нақты жоспар:*",
+    ]
+    lines.extend(f"• {item}" for item in plan["schedule"])
+    lines.extend([
+        f"\n📌 *Есеп:* {proof}.",
+        f"🛟 *Қиын болса:* {plan['fallback']}",
+        f"\n⏰ Күнді {DEADLINE_HOUR}:00-ге дейін жап.",
+    ])
     return "\n".join(lines)
 
 
 async def send_day_to_user(context: ContextTypes.DEFAULT_TYPE, user: dict):
     day = user["current_day"]
+    if user["category"] not in PROGRAMS:
+        await context.bot.send_message(
+            user["telegram_id"],
+            "📌 TARTIP бағдарламалары жаңартылды. Сенің бұрынғы бағытың енді "
+            "негізгі курсқа кірмейді. Жаңа бағыт таңдау үшін админге жаз - ол "
+            "профильді қауіпсіз түрде ауыстырып береді.",
+        )
+        return
     if day > TOTAL_DAYS:
         await context.bot.send_message(
             user["telegram_id"],
@@ -397,10 +399,8 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_total_tasks_for_day(day: int, cat: dict) -> int:
-    """Сол күнге қанша тапсырма (ашық әдет + апта фокусы) қажет екенін есептейді."""
-    unlocked = get_unlocked_habit_count(day, len(cat["core_habits"]))
-    has_focus = unlocked >= len(cat["core_habits"])
-    return unlocked + (1 if has_focus else 0)
+    """Жаңа жүйеде бір негізгі күндік миссия бар; ол фото, мәтін не батырмамен жабылады."""
+    return 1
 
 
 async def daily_send_job(context: ContextTypes.DEFAULT_TYPE):
@@ -554,6 +554,25 @@ async def handle_habit_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer("✅ Белгіленді!")
 
 
+async def handle_plan_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    telegram_id = update.effective_user.id
+    user = db.get_user(telegram_id)
+    if not user:
+        return
+    day = int(query.data.split("_")[1])
+    if user["current_day"] != day:
+        await query.answer("Бұл күннің жоспары ескірген.", show_alert=True)
+        return
+    plan = get_daily_plan(user["category"], day)
+    await query.answer()
+    await query.message.reply_text(
+        f"🛟 *Жоспар B — {plan['title']}*\n\n{plan['fallback']}\n\n"
+        "Бүгін 100% мінсіз болу міндет емес. Ең кіші нұсқасын орында да, ертең қайта жалғастыр.",
+        parse_mode="Markdown",
+    )
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     user = db.get_user(telegram_id)
@@ -561,13 +580,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     day = user["current_day"]
-    cat = CATEGORIES[user["category"]]
-    photo_habit = next((h for h in cat["core_habits"] if h["type"] == "photo"), None)
-    if not photo_habit:
+    plan = get_daily_plan(user["category"], day)
+    if plan["proof"] != "photo":
         return
 
     file_id = update.message.photo[-1].file_id
-    streak = db.record_habit_checkin(telegram_id, day, photo_habit["id"], proof_file_id=file_id)
+    streak = db.record_habit_checkin(telegram_id, day, "daily_plan", proof_file_id=file_id)
 
     await update.message.reply_text(f"✅ Фото қабылданды! 🔥 {streak} күн тоқтаусыз.")
 
@@ -575,7 +593,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_photo(
                 admin_id, file_id,
-                caption=f"📸 {user['full_name']} (@{user['username']}) — {day}-күн, {photo_habit['text']}"
+                caption=f"📸 {user['full_name']} (@{user['username']}) — {day}-күн, {plan['title']}"
             )
         except Exception:
             pass
@@ -588,12 +606,11 @@ async def handle_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     day = user["current_day"]
-    cat = CATEGORIES[user["category"]]
-    text_habit = next((h for h in cat["core_habits"] if h["type"] == "text"), None)
-    if not text_habit:
+    plan = get_daily_plan(user["category"], day)
+    if plan["proof"] != "text":
         return
 
-    streak = db.record_habit_checkin(telegram_id, day, text_habit["id"], text_response=update.message.text)
+    streak = db.record_habit_checkin(telegram_id, day, "daily_plan", text_response=update.message.text)
     await update.message.reply_text(f"✅ Жауабың қабылданды! 🔥 {streak} күн тоқтаусыз.")
 
 
@@ -669,17 +686,173 @@ async def handle_lesson_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(f"{lesson['title']}\n\n▶️ {lesson['link']}")
 
 
+ADMIN_PAGE_SIZE = 6
+
+
+def get_admin_user_snapshot(user: dict) -> dict:
+    """Админге сандар емес, клиентпен не істеу керегін көрсететін қысқа күй."""
+    day = user["current_day"]
+    if user["paused"]:
+        return {"label": "⏸ Паузада", "priority": "paused", "completed": 0, "total": 0}
+    if day > TOTAL_DAYS:
+        return {"label": "🏁 Курс аяқталды", "priority": "done", "completed": 0, "total": 0}
+
+    cat = CATEGORIES.get(user["category"], {})
+    total = get_total_tasks_for_day(day, cat) if cat else 0
+    completed = len(db.get_completed_habits_today(user["telegram_id"], day))
+    if not user["last_checkin_date"] and day <= 1:
+        label, priority = "🆕 Жаңа қатысушы", "new"
+    elif completed == 0:
+        label, priority = "🔴 Бүгін байланыс керек", "red"
+    elif completed < total:
+        label, priority = "🟡 Бүгін аяқтамаған", "yellow"
+    else:
+        label, priority = "🟢 Бүгін орындаған", "green"
+    return {"label": label, "priority": priority, "completed": completed, "total": total}
+
+
+def get_admin_users(filter_name: str = "all") -> list[dict]:
+    users = db.get_all_users()
+    if filter_name == "attention":
+        return [u for u in users if get_admin_user_snapshot(u)["priority"] in {"red", "yellow"}]
+    if filter_name == "new":
+        return [u for u in users if get_admin_user_snapshot(u)["priority"] == "new"]
+    return users
+
+
+def build_admin_dashboard() -> tuple[str, InlineKeyboardMarkup]:
+    users = db.get_all_users()
+    snapshots = [get_admin_user_snapshot(u) for u in users]
+    attention = sum(s["priority"] in {"red", "yellow"} for s in snapshots)
+    new_users = sum(s["priority"] == "new" for s in snapshots)
+    completed_today = sum(s["priority"] == "green" for s in snapshots)
+    text = (
+        "👑 *TARTIP ADMIN — бүгінгі басқару*\n\n"
+        f"🔴🟡 Назар керек: *{attention}*\n"
+        f"🆕 Жаңа қатысушы: *{new_users}*\n"
+        f"🟢 Бүгін жоспарды орындаған: *{completed_today}*\n"
+        f"👥 Барлық клиент: *{len(users)}*\n\n"
+        "Төменнен адамды аш: әр карточкада бүгінгі орындалуы, мақсаты және бірден әрекет ету батырмалары бар."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔴🟡 Назар керек ({attention})", callback_data="admin_list_attention_0")],
+        [InlineKeyboardButton(f"🆕 Жаңа қатысушылар ({new_users})", callback_data="admin_list_new_0")],
+        [InlineKeyboardButton("👥 Барлық клиенттер каталогы", callback_data="admin_list_all_0")],
+        [InlineKeyboardButton("📊 Қысқа статистика", callback_data="admin_stats")],
+    ])
+    return text, keyboard
+
+
+def build_admin_list(filter_name: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    users = get_admin_users(filter_name)
+    max_page = max(0, (len(users) - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, max_page))
+    shown = users[page * ADMIN_PAGE_SIZE:(page + 1) * ADMIN_PAGE_SIZE]
+    titles = {"all": "👥 Барлық клиенттер", "attention": "🔴🟡 Назар керек", "new": "🆕 Жаңа қатысушылар"}
+    text = f"{titles[filter_name]}\n\nАдамды басып, толық картасын аш. {len(users)} адам · {page + 1}/{max_page + 1} бет"
+    keyboard = []
+    for user in shown:
+        snapshot = get_admin_user_snapshot(user)
+        name = user["full_name"] or "Аты жазылмаған"
+        label = f"{snapshot['label']} · {name} · {user['current_day']}/{TOTAL_DAYS}"
+        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"admin_user_{user['telegram_id']}_{filter_name}_{page}")])
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("◀️ Алдыңғы", callback_data=f"admin_list_{filter_name}_{page - 1}"))
+    if page < max_page:
+        navigation.append(InlineKeyboardButton("Келесі ▶️", callback_data=f"admin_list_{filter_name}_{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton("🏠 Админ мәзірі", callback_data="admin_home")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def build_admin_user_card(user: dict, filter_name: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    snapshot = get_admin_user_snapshot(user)
+    category_name = CATEGORIES.get(user["category"], {}).get("name", "Белгісіз бағыт")
+    username = f"@{user['username']}" if user.get("username") else "username жоқ"
+    progress = "Курс аяқталды" if user["current_day"] > TOTAL_DAYS else f"{snapshot['completed']}/{snapshot['total']} тапсырма"
+    last_checkin = user["last_checkin_date"] or "Әлі check-in жоқ"
+    text = (
+        f"👤 {user['full_name']} ({username})\n\n"
+        f"Күйі: {snapshot['label']}\n"
+        f"Бағыты: {category_name}\n"
+        f"Мақсаты: {user['goal']}\n"
+        f"Неге келді: {user.get('goal_why') or 'жазылмаған'}\n\n"
+        f"📅 Күн: {user['current_day']}/{TOTAL_DAYS}\n"
+        f"✅ Бүгін: {progress}\n"
+        f"🔥 Қатарынан: {user['streak']} күн\n"
+        f"🕓 Соңғы белгі: {last_checkin}\n"
+        f"ID: {user['telegram_id']}"
+    )
+    action = "▶️ Қайта қосу" if user["paused"] else "⏸ Паузаға қою"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(action, callback_data=f"admin_toggle_{user['telegram_id']}_{filter_name}_{page}")],
+        [InlineKeyboardButton("🔄 Прогресті 1-күнге қайтару", callback_data=f"admin_reset_{user['telegram_id']}_{filter_name}_{page}")],
+        [InlineKeyboardButton("◀️ Каталогқа оралу", callback_data=f"admin_list_{filter_name}_{page}")],
+        [InlineKeyboardButton("🏠 Админ мәзірі", callback_data="admin_home")],
+    ])
+    return text, keyboard
+
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    cats = db.categorize_users()
-    await update.message.reply_text(
-        f"👑 *TARTIP ADMIN*\n\n"
-        f"👥 Барлығы активті: {len(cats['green']) + len(cats['yellow']) + len(cats['red'])}\n\n"
-        f"🟢 Қалыпты: {len(cats['green'])}\n🟡 Назар керек: {len(cats['yellow'])}\n🔴 Араласыңыз: {len(cats['red'])}\n\n"
-        f"Толығырақ: /problems",
-        parse_mode="Markdown",
-    )
+    text, keyboard = build_admin_dashboard()
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админге командаларды есте сақтамай, каталог арқылы басқаруға мүмкіндік береді."""
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Бұл бөлім тек админге арналған.", show_alert=True)
+        return
+    await query.answer()
+    parts = query.data.split("_")
+    action = parts[1]
+
+    if action == "home":
+        text, keyboard = build_admin_dashboard()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+    if action == "stats":
+        s = db.get_stats()
+        await query.edit_message_text(
+            f"📊 TARTIP қысқа статистика\n\nБарлығы: {s['total']}\nАктивті: {s['active']}\n"
+            f"Паузада: {s['paused']}\nОрташа қатарынан: {s['avg_streak']} күн",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Админ мәзірі", callback_data="admin_home")]]),
+        )
+        return
+    if action == "list":
+        filter_name, page = parts[2], int(parts[3])
+        text, keyboard = build_admin_list(filter_name, page)
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+
+    telegram_id, filter_name, page = int(parts[2]), parts[3], int(parts[4])
+    user = db.get_user(telegram_id)
+    if not user:
+        await query.edit_message_text("Клиент табылмады. Ол өшірілген болуы мүмкін.")
+        return
+    if action == "toggle":
+        db.set_paused(telegram_id, not bool(user["paused"]))
+        user = db.get_user(telegram_id)
+    elif action == "reset":
+        await query.edit_message_text(
+            f"⚠️ {user['full_name']} клиентінің прогресін 1-күнге қайтару керек пе?\n"
+            "Барлық бұрынғы орындалған тапсырмалар өшеді.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Иә, прогресті нөлдеу", callback_data=f"admin_confirmreset_{telegram_id}_{filter_name}_{page}")],
+                [InlineKeyboardButton("Жоқ, клиент картасына оралу", callback_data=f"admin_user_{telegram_id}_{filter_name}_{page}")],
+            ]),
+        )
+        return
+    elif action == "confirmreset":
+        db.reset_progress(telegram_id)
+        user = db.get_user(telegram_id)
+    text, keyboard = build_admin_user_card(user, filter_name, page)
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -841,8 +1014,10 @@ def main():
 
     application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^habit_"))
     application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^noop$"))
+    application.add_handler(CallbackQueryHandler(handle_plan_help_callback, pattern=r"^planhelp_"))
     application.add_handler(CallbackQueryHandler(handle_lesson_callback, pattern=r"^lesson_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_continue_callback, pattern=r"^continue_"))
+    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^admin_"))
 
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
