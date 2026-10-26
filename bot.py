@@ -1,16 +1,20 @@
 """
-TARTIP Course Bot V3 — категорияға негізделген, дедлайн жүйесімен, күнде
-бірнеше тапсырмасы бар нұсқа.
+TARTIP Course Bot V4.
 
-V3 жаңалықтары:
-- Онбординг: адам 6 категориядан біреуін таңдайды + мақсатын және себебін жазады
-- Күнде 3 тұрақты негізгі әдет + аптаның фокус тапсырмасы (барлығы жеке белгіленеді)
-- Әр тапсырмада "неге" түсіндірмесі
-- Дедлайн жүйесі: еске салу (2 сағат/30 минут қалғанда) + автоматты күн ауысу
-- /whoami — админ диагностикасы үшін (өз telegram ID-іңді көру)
-- Бұрынғы: Access system, бөлек меню, /lessons, /admin, /pause/resume/reset
+V3-тен негізгі өзгерістер:
+- Тіркеуде қысқа анкета (ояну/жату, ас саны, жаттығу орны, шектеулер, денсаулық белгісі, 18+)
+  және миссиялар клиенттің уақытына сай жеке құрылады (plan.py)
+- 5 бағыт × 28 күн, әр күн — бір нақты миссия; жауап жазатын күндерде жауап «Менің жүйем»
+  құжатына жиналады (/system), 28-күні толық құжат беріледі
+- «⚡ Жеңіл нұсқа» батырмасы және кешегі күнді жабу («екі рет қатар өткізбе»)
+- Жауап валидациясы: қысқа/кездейсоқ мәтін миссияны жаппайды; дауыстық жауап қабылданады
+- Апталық review жауабы бөлек сақталады және келесі аптаға бейімделу ұсынысын береді
+- /support нақты админге жетеді, админ батырмамен жауап береді
+- /forget растаумен; /wipe, /pause және т.б. қате санға төзімді
+- Админ: уақытқа сай күй, апталық орындалу, соңғы жауаптар, клиентке хабар жазу,
+  апталық қорытынды жобасы, күндік дайджест
 """
-import json
+import html
 import logging
 import os
 import threading
@@ -23,7 +27,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ConversationHandler, ContextTypes, filters,
@@ -31,6 +35,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 import database as db
+import plan as plan_mod
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,64 +50,55 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 DAILY_SEND_HOUR = int(os.environ.get("DAILY_SEND_HOUR", "8"))
 DEADLINE_HOUR = int(os.environ.get("DEADLINE_HOUR", "22"))
+ADMIN_DIGEST_HOUR = int(os.environ.get("ADMIN_DIGEST_HOUR", "10"))
 TOTAL_DAYS = 28
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
+FITNESS = plan_mod.FITNESS
+MEAL_CATEGORIES = plan_mod.MEAL_CATEGORIES
 
-ASKING_CATEGORY, ASKING_NAME, ASKING_GOAL, ASKING_WHY = range(4)
+ASKING_CATEGORY, ASKING_NAME, ASKING_GOAL, ASKING_WHY, INTAKE = range(5)
 
-with open("categories.json", "r", encoding="utf-8") as f:
-    CATEGORIES = json.load(f)
+CATEGORIES = plan_mod.load_json("categories.json")
+PROGRAMS = plan_mod.load_json("programs.json")
+LESSONS = plan_mod.load_json("lessons.json")
 
-# "Салауатты өмір салты" жеке курс емес: оның пайдалы қағидалары басқа
-# бағдарламаларға енгізілді. Негізгі таңдауда тек бес нақты бағыт қалады.
-CATEGORIES.pop("salauatty_omir", None)
+WEEKLY_REVIEW_DAYS = {7: 1, 14: 2, 21: 3, 28: 4}
+WEEK_START_DAYS = {1, 8, 15, 22}
 
-with open("programs.json", "r", encoding="utf-8") as f:
-    PROGRAMS = json.load(f)
-
-with open("lessons.json", "r", encoding="utf-8") as f:
-    LESSONS = json.load(f)
-
-WEEK_TITLES = {
-    range(1, 8): "1-апта: Диагностика + бастау",
-    range(8, 15): "2-апта: Белсендіру",
-    range(15, 22): "3-апта: Тұрақтылық",
-    range(22, 29): "4-апта: Бекіту",
-}
-WEEK_START_DAYS = {1: "1", 8: "2", 15: "3", 22: "4"}
+STATUS_LABELS = {"full": "✅ Миссия орындалды", "light": "⚡ Жеңіл нұсқа есептелді", "catchup": "↩️ Кешегі күн жабылды"}
 
 
-def get_week_title(day: int) -> str:
-    for r, title in WEEK_TITLES.items():
-        if day in r:
-            return title
-    return ""
+# ---------- Көмекші функциялар ----------
+
+def esc(text) -> str:
+    return html.escape(str(text if text is not None else ""), quote=False)
 
 
-def get_week_number_str(day: int) -> str:
-    if day <= 7:
-        return "1"
-    if day <= 14:
-        return "2"
-    if day <= 21:
-        return "3"
-    return "4"
+def is_admin(telegram_id: int) -> bool:
+    return telegram_id in ADMIN_IDS
+
+
+def parse_id(args):
+    """/pause 123 сияқты командалардағы ID-ді қауіпсіз оқиды."""
+    try:
+        return int(args[0])
+    except (IndexError, ValueError):
+        return None
 
 
 def get_daily_plan(category_key: str, day: int) -> dict:
-    """28 күндік бағдарламадан дәл сол күннің нақты миссиясын қайтарады."""
     week_index = min(max((day - 1) // 7, 0), 3)
     day_index = (day - 1) % 7
     return PROGRAMS[category_key]["weeks"][week_index]["days"][day_index]
 
 
-def get_week_theme(category_key: str, day: int) -> str:
-    week_index = min(max((day - 1) // 7, 0), 3)
-    return PROGRAMS[category_key]["weeks"][week_index]["theme"]
+def get_week(category_key: str, day: int) -> dict:
+    return PROGRAMS[category_key]["weeks"][plan_mod.week_of(day) - 1]
 
 
-def is_admin(telegram_id: int) -> bool:
-    return telegram_id in ADMIN_IDS
+def get_week_title(day: int) -> str:
+    week = min(max((day - 1) // 7, 0), 3) + 1
+    return f"{week}-апта"
 
 
 async def check_channel_membership(context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> bool:
@@ -121,25 +117,26 @@ async def check_channel_membership(context: ContextTypes.DEFAULT_TYPE, telegram_
 async def setup_menus(application: Application):
     default_commands = [
         BotCommand("start", "Тіркелу / қайта кіру"),
-        BotCommand("today", "Бүгінгі тапсырмаларды көру"),
-        BotCommand("roadmap", "🗺 Толық 28 күндік жолыңды көру"),
+        BotCommand("today", "Бүгінгі миссияны көру"),
+        BotCommand("system", "🧩 Менің жүйем (өз жауаптарым)"),
+        BotCommand("roadmap", "🗺 Толық 28 күндік жолым"),
         BotCommand("progress", "Менің прогресім"),
         BotCommand("lessons", "📚 Видео сабақтар каталогы"),
-        BotCommand("support", "Көмек керек болса"),
-        BotCommand("forget", "Деректерімді толық өшіру (қайта бастау)"),
+        BotCommand("support", "Кураторға жазу"),
+        BotCommand("forget", "Деректерімді толық өшіру"),
     ]
     await application.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
 
     admin_commands = default_commands + [
-        BotCommand("whoami", "Өз telegram ID-іңді көру (диагностика)"),
-        BotCommand("wipe", "Клиентті толық ұмыту (/wipe id)"),
+        BotCommand("whoami", "Өз telegram ID-іңді көру"),
         BotCommand("admin", "👑 Админ панель"),
         BotCommand("stats", "Жалпы статистика"),
         BotCommand("problems", "Назар керек клиенттер"),
-        BotCommand("user", "Клиент профилі (/user id)"),
+        BotCommand("user", "Клиент картасы (/user id)"),
         BotCommand("pause", "Клиентті тоқтату (/pause id)"),
         BotCommand("resume", "Клиентті қайта қосу (/resume id)"),
         BotCommand("reset", "Прогресті нөлдеу (/reset id)"),
+        BotCommand("wipe", "Клиентті толық ұмыту (/wipe id)"),
         BotCommand("broadcast", "Барлығына хабарлама"),
     ]
     for admin_id in ADMIN_IDS:
@@ -153,11 +150,41 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     admin_status = "ИӘ ✅" if is_admin(uid) else "ЖОҚ ❌"
     await update.message.reply_text(
-        f"Сенің Telegram ID-ің: `{uid}`\n"
+        f"Сенің Telegram ID-ің: {uid}\n"
         f"Админ құқығың бар ма: {admin_status}\n\n"
-        f"Егер админ болу керек болса, осы ID-ді Render-дегі ADMIN_IDS айнымалысына қос.",
-        parse_mode="Markdown",
+        f"Админ болу керек болса, осы ID-ді хостингтегі ADMIN_IDS айнымалысына қос."
     )
+
+
+# ---------- Тіркеу және анкета ----------
+
+INTAKE_DEFS = {
+    "adult": {"type": "buttons", "q": "🔞 Жасың 18-ге толды ма?",
+              "options": [("yes", "Иә"), ("no", "Жоқ")]},
+    "wake": {"type": "time", "q": "⏰ Әдетте сағат нешеде тұрасың? (мыс. 07:00)"},
+    "bed": {"type": "time", "q": "🌙 Әдетте сағат нешеде жатасың? (мыс. 23:30)"},
+    "meals": {"type": "buttons", "q": "🍽 Күніне неше рет тамақтана аласың?",
+              "options": [("2", "2 рет"), ("3", "3 рет"), ("4", "4 рет"), ("5", "5 рет")]},
+    "place": {"type": "buttons", "q": "🏋️ Жаттығуды қайда жасайсың?",
+              "options": [("home", "🏠 Үйде"), ("gym", "🏢 Залда")]},
+    "restrictions": {"type": "text",
+                     "q": "🚫 Жемейтін немесе аллергиялы тағамдарың бар ма? Қысқаша жаз. Жоқ болса «жоқ» деп жаз."},
+    "health": {"type": "buttons",
+               "q": ("⚕️ Дәрігер қойған шектеу, жүктілік, созылмалы ауру немесе жарақат бар ма? "
+                     "Мен диагноз қоймаймын және ауру туралы егжей-тегжей сұрамаймын: бұл жауап тек "
+                     "қауіпсіздік ескертуін қосу үшін."),
+               "options": [("no", "Жоқ"), ("yes", "Бар / сенімді емеспін"), ("skip", "Айтқым келмейді")]},
+}
+
+
+def intake_steps_for(category: str) -> list:
+    steps = ["adult", "wake", "bed"]
+    if category in MEAL_CATEGORIES:
+        steps.append("meals")
+    if category in FITNESS:
+        steps += ["place", "restrictions"]
+    steps.append("health")
+    return steps
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,11 +192,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(telegram_id)
     if user:
         cat = CATEGORIES.get(user["category"], {})
+        streak = db.get_streak(telegram_id, user["current_day"])
         await update.message.reply_text(
             f"Сәлем, {user['full_name']}! 👋\n\n"
-            f"📅 {user['current_day']}/{TOTAL_DAYS}-күн · {get_week_title(user['current_day'])}\n"
+            f"📅 {min(user['current_day'], TOTAL_DAYS)}/{TOTAL_DAYS}-күн · {get_week_title(min(user['current_day'], TOTAL_DAYS))}\n"
             f"🎯 Бағыт: {cat.get('name', '?')}\n"
-            f"🔥 {user['streak']} күн тоқтаусыз"
+            f"🔥 {streak} күн қатарынан\n\n"
+            f"Бүгінгі миссия: /today · Менің жүйем: /system"
         )
         return ConversationHandler.END
 
@@ -181,6 +210,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    context.user_data.clear()
     keyboard = [
         [InlineKeyboardButton(cat["name"], callback_data=f"cat_{key}")]
         for key, cat in CATEGORIES.items()
@@ -196,6 +226,8 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     category_key = query.data.split("_", 1)[1]
+    if category_key not in CATEGORIES:
+        return ASKING_CATEGORY
     context.user_data["category"] = category_key
 
     cat = CATEGORIES[category_key]
@@ -204,8 +236,7 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf_link = cat.get("pdf_link")
     if pdf_link:
         await query.message.reply_text(
-            f"📄 Алдымен толық гайдыңды оқып шық — онда осы бағыттың негізгі білімі, "
-            f"чек-листі және жиі қателіктер жазылған:\n\n{pdf_link}"
+            f"📄 Алдымен гайдыңды оқып шық: онда осы бағыттың негізгі білімі мен чек-листі бар:\n\n{pdf_link}"
         )
 
     await query.message.reply_text("Енді танысайық — атыңды жаз:")
@@ -213,181 +244,324 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["full_name"] = update.message.text
+    name = (update.message.text or "").strip()[:60]
+    if not name:
+        await update.message.reply_text("Атыңды жаз.")
+        return ASKING_NAME
+    context.user_data["full_name"] = name
     await update.message.reply_text(
-        f"Танысқаныма қуаныштымын, {update.message.text}! 🙌\n\n"
-        "Нақты мақсатыңды жаз (мыс. '5 кг арықтау' немесе '10 кг бұлшық ет қосу'):"
+        f"Танысқаныма қуаныштымын, {name}! 🙌\n\n"
+        "Нақты мақсатыңды жаз (мыс. '5 кг арықтау', 'таңғы 07:00-де тұру'):"
     )
     return ASKING_GOAL
 
 
 async def ask_why(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["goal"] = update.message.text
+    goal = (update.message.text or "").strip()[:200]
+    if not goal:
+        await update.message.reply_text("Мақсатыңды жаз.")
+        return ASKING_GOAL
+    context.user_data["goal"] = goal
     await update.message.reply_text("Неге дәл осы мақсатқа жеткің келеді? (қысқаша жаз)")
     return ASKING_WHY
 
 
+async def start_intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    why = (update.message.text or "").strip()[:300]
+    if not why:
+        await update.message.reply_text("Қысқаша болса да жаз.")
+        return ASKING_WHY
+    context.user_data["goal_why"] = why
+    category = context.user_data["category"]
+    context.user_data["intake"] = {"steps": intake_steps_for(category), "i": 0, "answers": {}}
+    await update.message.reply_text(
+        "Миссияларды өз тәртібіңе бейімдеу үшін бірнеше қысқа сұрақ қоямын. "
+        "Деректерің тек ботта және кураторда сақталады, /forget арқылы кез келген уақытта өшіре аласың."
+    )
+    await send_intake_question(update.message, context.user_data["intake"])
+    return INTAKE
+
+
+async def send_intake_question(message, state: dict):
+    key = state["steps"][state["i"]]
+    definition = INTAKE_DEFS[key]
+    markup = None
+    if definition["type"] == "buttons":
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(label, callback_data=f"in_{key}_{value}")
+            for value, label in definition["options"]
+        ]])
+    await message.reply_text(definition["q"], reply_markup=markup)
+
+
+async def intake_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("intake")
+    if not state:
+        await update.effective_message.reply_text("Тіркеуді қайта бастайық: /start")
+        return ConversationHandler.END
+
+    key = state["steps"][state["i"]]
+    definition = INTAKE_DEFS[key]
+    query = update.callback_query
+    category = context.user_data["category"]
+
+    if query:
+        await query.answer()
+        parts = query.data.split("_", 2)
+        message = query.message
+        if len(parts) == 3 and parts[1] == "switch":
+            new_category = parts[2]
+            if new_category not in CATEGORIES or new_category in FITNESS:
+                return INTAKE
+            context.user_data["category"] = new_category
+            state["steps"] = intake_steps_for(new_category)
+            state["answers"]["adult"] = "no"
+            state["i"] = state["steps"].index("adult") + 1
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await message.reply_text(f"Таңдадың: {CATEGORIES[new_category]['name']} ✅")
+            await send_intake_question(message, state)
+            return INTAKE
+        if len(parts) < 3 or parts[1] != key:
+            return INTAKE
+        value = parts[2]
+        if value not in [v for v, _ in definition.get("options", [])]:
+            return INTAKE
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+    else:
+        message = update.message
+        text = (message.text or "").strip()
+        if definition["type"] == "buttons":
+            await message.reply_text("Төмендегі батырмалардың бірін бас 👇")
+            return INTAKE
+        if definition["type"] == "time":
+            value = plan_mod.parse_time(text)
+            if not value:
+                await message.reply_text("Уақытты сағат:минут түрінде жаз, мысалы 07:30.")
+                return INTAKE
+        else:
+            value = text[:120]
+            if not value:
+                await message.reply_text("Қысқаша жауап жаз («жоқ» болса да жарайды).")
+                return INTAKE
+
+    if key == "adult" and value == "no" and category in FITNESS:
+        state["answers"]["adult"] = "no"
+        await message.reply_text(
+            "Бұл бағыт ересектерге арналған: жасөспірімнің тамағын, салмағын немесе жүктемесін "
+            "өзгерту дәрігер мен ата-ананың бақылауында болуы керек. Қауіпсіз бағыттардың бірін таңда:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(CATEGORIES["discipline"]["name"], callback_data="in_switch_discipline")],
+                [InlineKeyboardButton(CATEGORIES["uyqy_energy"]["name"], callback_data="in_switch_uyqy_energy")],
+            ]),
+        )
+        return INTAKE
+
+    state["answers"][key] = value
+    state["i"] += 1
+    if state["i"] >= len(state["steps"]):
+        return await finish_registration(update, context, message)
+    await send_intake_question(message, state)
+    return INTAKE
+
+
 def build_roadmap_text(category_key: str) -> str:
-    """Бүкіл 28 күндік жолды бір хабарламада көрсетеді — адам не үшін не істейтінін алдын ала біледі."""
     cat = CATEGORIES[category_key]
-    lines = [
-        f"🗺 *Сенің 28 күндік жолың — {cat['name']}*",
-        "",
-        "Күн сайын осы 3 негізгі әдетті орындайсың (бірінші 2 күнде біртіндеп үйренесің, 3-күннен бастап толық):",
-        "",
-    ]
-    for habit in cat["core_habits"]:
-        lines.append(f"• {habit['text']}")
-    lines.append("")
-    lines.append("Ал әр апта өз фокусымен ерекшеленеді:")
-    lines.append("")
-
-    week_titles = {"1": "1-апта: Диагностика + бастау", "2": "2-апта: Белсендіру",
-                   "3": "3-апта: Тұрақтылық", "4": "4-апта: Бекіту"}
-    for week_num in ["1", "2", "3", "4"]:
-        focus = cat["weekly_focus"][week_num]
-        lines.append(f"*{week_titles[week_num]}*")
-        lines.append(f"🎯 {focus['text']}")
-        lines.append(f"💡 {focus['why']}")
+    prog = PROGRAMS[category_key]
+    lines = [f"🗺 <b>Сенің 28 күндік жолың — {esc(cat['name'])}</b>", ""]
+    for week in prog["weeks"]:
+        lines.append(f"<b>{esc(week['theme'])}</b>")
+        lines.append(f"🎯 {esc(week['goal'])}")
         lines.append("")
-
-    lines.append("28-күннің соңында сенде — мақсатыңа жетудің дайын фундаменті болады. "
-                  "Әр күн осы жолдың бір қадамы, кездейсоқ емес.")
+    lines.append(
+        "Күн сайын бір нақты миссия келеді: ол сенің уақытыңа бейімделеді. Жауап жазатын күндердегі "
+        "жауаптарың «Менің жүйем» құжатына жиналады (/system). 28-күні сенде ботсыз да жалғастыра "
+        "алатын жеке жүйең болады."
+    )
     return "\n".join(lines)
 
 
 async def roadmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(update.effective_user.id)
-    if not user:
+    if not user or user["category"] not in PROGRAMS:
         await update.message.reply_text("Алдымен /start арқылы тіркел.")
         return
-    await update.message.reply_text(build_roadmap_text(user["category"]), parse_mode="Markdown")
+    await update.message.reply_text(build_roadmap_text(user["category"]), parse_mode=ParseMode.HTML)
 
 
-async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    goal_why = update.message.text
+async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE, message):
     tg_user = update.effective_user
-    category = context.user_data["category"]
-    full_name = context.user_data["full_name"]
-    goal = context.user_data["goal"]
+    data = context.user_data
+    answers = data["intake"]["answers"]
+    category = data["category"]
 
-    db.add_user(tg_user.id, tg_user.username or "", full_name, category, goal, goal_why)
+    profile = {
+        "wake_time": answers.get("wake"),
+        "bed_time": answers.get("bed"),
+        "meals": int(answers["meals"]) if answers.get("meals") else None,
+        "place": answers.get("place"),
+        "restrictions": answers.get("restrictions"),
+        "health_flag": answers.get("health"),
+        "adult": answers.get("adult"),
+    }
+    db.add_user(tg_user.id, tg_user.username or "", data["full_name"], category,
+                data["goal"], data["goal_why"], profile=profile)
+    user = db.get_user(tg_user.id)
+    values = plan_mod.profile_values(user)
 
-    cat_name = CATEGORIES[category]["name"]
-    await update.message.reply_text(
-        f"Керемет! Мақсатыңды жаздым:\n\n"
-        f"🎯 Бағыт: {cat_name}\n"
-        f"📝 Мақсат: {goal}\n"
-        f"💭 Себебі: {goal_why}\n\n"
-        f"Ертеңнен бастап күн сайын таңғы {DAILY_SEND_HOUR}:00-де саған тапсырмалар келеді. "
-        f"Дедлайн: кешкі {DEADLINE_HOUR}:00."
-    )
-    await update.message.reply_text(build_roadmap_text(category), parse_mode="Markdown")
-    await update.message.reply_text("Бүгінгі 1-күн тапсырмасын дереу көргің келсе — /today жаз.")
+    lines = [
+        "✅ Профилің дайын.\n",
+        f"🎯 Бағыт: {CATEGORIES[category]['name']}",
+        f"📝 Мақсат: {data['goal']}",
+        f"💭 Себебі: {data['goal_why']}\n",
+        f"⏰ Ояну: {values['wake']} · 🌙 Жату: {values['bed']} · 📵 Экранды өшіру: {values['screens_off']}",
+    ]
+    if category in MEAL_CATEGORIES:
+        lines.append(f"🍽 Астар уақыты: {values['mlist']}")
+        if profile["meals"] and values["meal_count"] < profile["meals"]:
+            lines.append("ℹ️ Күн қысқа болғандықтан, ас санын азайттым: соңғы ас жатуға ~3 сағат қалғанда болады.")
+    lines.append(f"\nБірінші миссияң ертең таңғы {DAILY_SEND_HOUR}:00-де келеді. Дедлайн: кешкі {DEADLINE_HOUR}:00. "
+                 "Дереу көргің келсе — /today.")
+    await message.reply_text("\n".join(lines))
+    if profile["health_flag"] == "yes":
+        await message.reply_text(
+            "⚕️ Денсаулығыңда шектеу бар деп белгіледің. TARTIP диагноз қоймайды және дәрігер "
+            "кеңесін алмастырмайды: тамақ немесе жаттығу жүйесін өзгертер алдында дәрігермен келіс."
+        )
+    await message.reply_text(build_roadmap_text(category), parse_mode=ParseMode.HTML)
+    await message.reply_text("Жауаптарың мен фотоларыңды тек куратор көреді. Көмек керек болса — /support.")
+    data.pop("intake", None)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("intake", None)
     await update.message.reply_text("Тіркелу тоқтатылды. Қайта бастау үшін /start жаз.")
     return ConversationHandler.END
 
 
-def get_unlocked_habit_count(day: int, total_habits: int) -> int:
-    """Алғашқы күндерде әдеттерді біртіндеп ашады — бірден толық жүктемей.
-    1-күн: 1 әдет, 2-күн: 2 әдет, 3-күннен бастап: барлығы + апта фокусы."""
-    return min(day, total_habits)
-
-
-def build_day_keyboard(telegram_id: int, day: int, category_key: str):
-    completed = db.get_completed_habits_today(telegram_id, day)
-    plan = get_daily_plan(category_key, day)
-    done = "daily_plan" in completed
-    if plan["proof"] == "button":
-        primary = InlineKeyboardButton(
-            "✅ Басты миссия орындалды" if done else "✅ Орындадым деп белгіле",
-            callback_data=f"habit_daily_plan_{day}",
-        )
-    else:
-        action = "Фото жібер" if plan["proof"] == "photo" else "Қысқа жауап жаз"
-        primary = InlineKeyboardButton(
-            "✅ Есеп қабылданды" if done else f"📤 {action}",
-            callback_data="noop",
-        )
-    return InlineKeyboardMarkup([
-        [primary],
-        [InlineKeyboardButton("🛟 Жоспар бұзылса не істеймін?", callback_data=f"planhelp_{day}")],
-    ])
-
+# ---------- Күндік миссия ----------
 
 def build_day_text(user: dict, day: int) -> str:
     plan = get_daily_plan(user["category"], day)
-    proof = "фото жібер" if plan["proof"] == "photo" else ("қысқа жауап жаз" if plan["proof"] == "text" else "төмендегі батырмамен белгіле")
+    r = plan_mod.render_day(plan, user)
+    week = get_week(user["category"], day)
+
     lines = [
-        f"📅 *{day}/{TOTAL_DAYS}-күн* · {get_week_theme(user['category'], day)}",
-        f"\n🎯 *{plan['title']}*",
-        plan["mission"],
-        "\n*Нақты жоспар:*",
+        f"📅 <b>{day}/{TOTAL_DAYS}-күн</b> · {esc(week['theme'])}",
+        "",
+        f"🎯 <b>{esc(r['title'])}</b>",
+        esc(r["mission"]),
+        "",
+        "<b>Нақты жоспар:</b>",
     ]
-    lines.extend(f"• {item}" for item in plan["schedule"])
+    lines.extend(f"• {esc(item)}" for item in r["schedule"])
+
+    lesson = LESSONS.get(str(r["lesson"])) if r["lesson"] else None
+    if lesson:
+        lines.append(f"\n📚 Сабақ: {esc(lesson['title'])}\n▶️ {lesson['link']}")
+
+    if week.get("core"):
+        lines.append(f"\n🔁 <b>Апта өзегі:</b> {esc(week['core'])}")
+
+    if r["proof"] == "button":
+        proof_line = "төмендегі батырманы бас."
+    elif r["proof"] == "photo":
+        proof_line = "фото жібер."
+    else:
+        proof_line = f"осы чатқа жауап жаз (дауыстық хабарлама да болады): {esc(r['ask'])}"
     lines.extend([
-        f"\n📌 *Есеп:* {proof}.",
-        f"🛟 *Қиын болса:* {plan['fallback']}",
+        f"\n📌 <b>Есеп:</b> {proof_line}",
+        f"🛟 <b>Қиын күн нұсқасы (2–10 минут):</b> {esc(r['fallback'])}",
         f"\n⏰ Күнді {DEADLINE_HOUR}:00-ге дейін жап.",
     ])
+    if user.get("health_flag") == "yes" and (r["med"] or day in WEEK_START_DAYS):
+        lines.append("\n⚕️ Денсаулығыңда шектеу бар деп белгіледің: тамақ немесе жаттығу жүктемесін өзгертер алдында дәрігермен келіс.")
     return "\n".join(lines)
+
+
+def build_day_keyboard(telegram_id: int, day: int, category_key: str) -> InlineKeyboardMarkup:
+    done = db.get_done_days(telegram_id)
+    plan = get_daily_plan(category_key, day)
+    rows = []
+    if day in done:
+        rows.append([InlineKeyboardButton(STATUS_LABELS.get(done[day], "✅ Орындалды"), callback_data=f"noop_{day}")])
+    else:
+        if plan["proof"] == "button":
+            rows.append([InlineKeyboardButton("✅ Орындадым", callback_data=f"done_{day}")])
+        else:
+            action = "📸 Фото жібер" if plan["proof"] == "photo" else "✍️ Жауап жаз"
+            rows.append([InlineKeyboardButton(action, callback_data=f"noop_{day}")])
+        rows.append([InlineKeyboardButton("⚡ Жеңіл нұсқаны орындадым", callback_data=f"light_{day}")])
+    rows.append([
+        InlineKeyboardButton("🛟 Жоспар B", callback_data=f"planhelp_{day}"),
+        InlineKeyboardButton("💬 Кураторға жазу", callback_data="ask_support"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_finish(context: ContextTypes.DEFAULT_TYPE, user: dict):
+    """Курс біткенде бір рет қана жіберіледі (күнде қайталанбайды)."""
+    if user.get("awaiting") == "finish_sent":
+        return
+    uid = user["telegram_id"]
+    done = db.get_done_days(uid)
+    if TOTAL_DAYS not in done:
+        for chunk in plan_mod.compile_system(user, PROGRAMS, db.get_text_responses(uid), CATEGORIES[user["category"]]["name"]):
+            await context.bot.send_message(uid, chunk)
+    await context.bot.send_message(
+        uid,
+        f"🎉 Құттықтаймын! Сен 28 күндік TARTIP курсын аяқтадың: {len(done)}/{TOTAL_DAYS} күн орындалды.\n\n"
+        "«Менің жүйем» құжатың жоғарыда (және кез келген уақытта /system). Енді оны ботсыз да қолдана аласың.\n\n"
+        "Қайта бастасаң, прогресс пен жауаптар өшеді (құжатың чатта қалады).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Сол бағытты 1-күннен қайта бастау", callback_data="continue_yes")],
+            [InlineKeyboardButton("🛑 Тоқтату", callback_data="continue_no")],
+        ]),
+    )
+    db.set_awaiting(uid, "finish_sent")
 
 
 async def send_day_to_user(context: ContextTypes.DEFAULT_TYPE, user: dict):
     day = user["current_day"]
+    uid = user["telegram_id"]
     if user["category"] not in PROGRAMS:
         await context.bot.send_message(
-            user["telegram_id"],
-            "📌 TARTIP бағдарламалары жаңартылды. Сенің бұрынғы бағытың енді "
-            "негізгі курсқа кірмейді. Жаңа бағыт таңдау үшін админге жаз - ол "
-            "профильді қауіпсіз түрде ауыстырып береді.",
+            uid,
+            "📌 TARTIP бағдарламалары жаңартылды. Сенің бұрынғы бағытың енді негізгі курсқа кірмейді. "
+            "Жаңа бағыт таңдау үшін админге жаз (/support): ол профильді қауіпсіз түрде ауыстырып береді.",
         )
         return
     if day > TOTAL_DAYS:
-        await context.bot.send_message(
-            user["telegram_id"],
-            "🎉 Құттықтаймын! Сен 28 күндік TARTIP курсын толық аяқтадың!\n\n"
-            "Бұл — үлкен жетістік. Енді сенде мақсатыңа жетудің фундаменті бар. "
-            "Жалғастырғың келе ме?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Иә, жалғастырам", callback_data="continue_yes")],
-                [InlineKeyboardButton("🛑 Жоқ, тоқтатам", callback_data="continue_no")],
-            ])
-        )
+        await send_finish(context, user)
         return
 
-    text = build_day_text(user, day)
-    keyboard = build_day_keyboard(user["telegram_id"], day, user["category"])
-    await context.bot.send_message(user["telegram_id"], text, parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Клиент өзін толық ұмыттыра алады — қайта /start арқылы бастан бастауға мүмкіндік береді."""
-    telegram_id = update.effective_user.id
-    user = db.get_user(telegram_id)
-    if not user:
-        await update.message.reply_text("Сен әлі тіркелмегенсің, ұмытатын дерек жоқ. /start жаз.")
-        return
-    db.delete_user(telegram_id)
-    await update.message.reply_text(
-        "🗑 Барлық деректерің өшірілді. /start арқылы қайтадан бастай аласың."
+    await context.bot.send_message(
+        uid, build_day_text(user, day), parse_mode=ParseMode.HTML,
+        reply_markup=build_day_keyboard(uid, day, user["category"]),
+        disable_web_page_preview=True,
     )
 
-
-async def wipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ: белгілі бір клиентті толық ұмыттыру (reset-тен айырмашылығы — профиль де өшеді)."""
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Қолдану: /wipe <telegram_id>")
-        return
-    target_id = int(context.args[0])
-    db.delete_user(target_id)
-    await update.message.reply_text(f"🗑 {target_id} толық ұмытылды (профиль де өшті).")
+    # «Екі рет қатар өткізбе»: кешегі миссия жабылмаса, жеңіл нұсқамен жабуға мүмкіндік
+    if day > 1:
+        done = db.get_done_days(uid)
+        prev = day - 1
+        if prev not in done:
+            prev_plan = plan_mod.render_day(get_daily_plan(user["category"], prev), user)
+            await context.bot.send_message(
+                uid,
+                f"↩️ Кешегі миссия («{esc(prev_plan['title'])}») жабылмады — бұл қалыпты. "
+                f"Қаласаң, жеңіл нұсқасын орындап жабуға болады:\n\n{esc(prev_plan['fallback'])}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Кешегіні жабу", callback_data=f"catchup_{prev}")
+                ]]),
+            )
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,179 +572,391 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_day_to_user(context, user)
 
 
-def get_total_tasks_for_day(day: int, cat: dict) -> int:
-    """Жаңа жүйеде бір негізгі күндік миссия бар; ол фото, мәтін не батырмамен жабылады."""
-    return 1
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Сен әлі тіркелмегенсің, ұмытатын дерек жоқ. /start жаз.")
+        return
+    await update.message.reply_text(
+        "⚠️ Барлық деректерің (профиль, жауаптар, прогресс) өшеді және қайтарылмайды. Растайсың ба?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Иә, барлығын өшір", callback_data="forget_yes")],
+            [InlineKeyboardButton("Жоқ, қалдыр", callback_data="forget_no")],
+        ]),
+    )
+
+
+async def handle_forget_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "forget_yes":
+        db.delete_user(update.effective_user.id)
+        await query.edit_message_text("🗑 Барлық деректерің өшірілді. /start арқылы қайтадан бастай аласың.")
+    else:
+        await query.edit_message_text("Жақсы, ештеңе өшпеді. Жалғастыра бер 💪")
+
+
+async def wipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    target_id = parse_id(context.args)
+    if target_id is None:
+        await update.message.reply_text("Қолдану: /wipe <telegram_id>")
+        return
+    db.delete_user(target_id)
+    await update.message.reply_text(f"🗑 {target_id} толық ұмытылды (профиль де өшті).")
+
+
+# ---------- Еске салулар және күн жылжыту ----------
+
+def mission_open(user: dict) -> bool:
+    day = user["current_day"]
+    if day > TOTAL_DAYS or user["category"] not in PROGRAMS:
+        return False
+    return day not in db.get_done_days(user["telegram_id"])
+
+
+def open_title(user: dict) -> str:
+    return esc(get_daily_plan(user["category"], user["current_day"])["title"])
 
 
 async def daily_send_job(context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_active_users()
-    for user in users:
+    for user in db.get_all_active_users():
         has_access = await check_channel_membership(context, user["telegram_id"])
         if not has_access:
             continue
         try:
+            db.clear_awaiting_prefixes(user["telegram_id"])
+            user = db.get_user(user["telegram_id"])
             await send_day_to_user(context, user)
         except Exception as e:
             logger.error(f"daily_send_job failed for {user['telegram_id']}: {e}")
 
 
-async def midday_check_job(context: ContextTypes.DEFAULT_TYPE):
-    """Түс кезінде жұмсақ еске салу — тек орындалмаған тапсырмасы барларға ғана жіберіледі."""
-    users = db.get_all_active_users()
-    for user in users:
-        day = user["current_day"]
-        if day > TOTAL_DAYS:
+async def _remind(context: ContextTypes.DEFAULT_TYPE, template: str):
+    for user in db.get_all_active_users():
+        if not mission_open(user):
             continue
-        cat = CATEGORIES[user["category"]]
-        total_habits = get_total_tasks_for_day(day, cat)
-        completed = len(db.get_completed_habits_today(user["telegram_id"], day))
-        if completed < total_habits:
-            try:
-                await context.bot.send_message(
-                    user["telegram_id"],
-                    f"👋 Түс болды! Бүгінгі тапсырмалардың {completed}/{total_habits} орындалды. "
-                    f"Уақыт бар кезде орында, дедлайн кешке {DEADLINE_HOUR}:00."
-                )
-            except Exception as e:
-                logger.error(f"midday_check_job failed for {user['telegram_id']}: {e}")
+        try:
+            await context.bot.send_message(
+                user["telegram_id"], template.format(title=open_title(user), hour=DEADLINE_HOUR),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"reminder failed for {user['telegram_id']}: {e}")
+
+
+async def midday_check_job(context: ContextTypes.DEFAULT_TYPE):
+    await _remind(context, "👋 Бүгінгі миссия: «{title}». Уақыт бар кезде орында; қиын болса ⚡ жеңіл нұсқа да есептеледі. /today")
 
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_active_users()
-    for user in users:
-        day = user["current_day"]
-        if day > TOTAL_DAYS:
-            continue
-        cat = CATEGORIES[user["category"]]
-        total_habits = get_total_tasks_for_day(day, cat)
-        completed = len(db.get_completed_habits_today(user["telegram_id"], day))
-        if completed < total_habits:
-            try:
-                await context.bot.send_message(
-                    user["telegram_id"],
-                    f"⏰ Дедлайнға 2 сағат қалды! Бүгінгі тапсырмалардың {completed}/{total_habits} орындалды. "
-                    f"/today арқылы қалғанын көр."
-                )
-            except Exception as e:
-                logger.error(f"reminder_job failed for {user['telegram_id']}: {e}")
+    await _remind(context, "⏰ Дедлайнға 2 сағат қалды. Миссия: «{title}». Кемі жеңіл нұсқасын жап: /today")
 
 
 async def final_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_active_users()
-    for user in users:
-        day = user["current_day"]
-        if day > TOTAL_DAYS:
-            continue
-        cat = CATEGORIES[user["category"]]
-        total_habits = get_total_tasks_for_day(day, cat)
-        completed = len(db.get_completed_habits_today(user["telegram_id"], day))
-        if completed < total_habits:
-            try:
-                await context.bot.send_message(
-                    user["telegram_id"],
-                    f"⚠️ Дедлайнға 30 минут қалды! Әлі {total_habits - completed} тапсырма қалды. Асығып үлгер!"
-                )
-            except Exception as e:
-                logger.error(f"final_reminder_job failed for {user['telegram_id']}: {e}")
+    await _remind(context, "⚠️ Дедлайнға 30 минут қалды. Миссия: «{title}». 2 минуттық жеңіл нұсқа да тізбекті сақтайды.")
 
 
-WEEKLY_REVIEW_DAYS = {7, 14, 21, 28}
-
-
-def build_weekly_review_text(day: int) -> str:
-    week_num = {7: "1", 14: "2", 21: "3", 28: "4"}[day]
+def build_weekly_review_text(week: int) -> str:
     return (
-        f"📊 *{week_num}-АПТА REVIEW*\n\n"
-        f"Бұл апта аяқталды! Қысқаша өзіңе есеп бер:\n\n"
-        f"• Бұл аптада не жақсы шықты?\n"
-        f"• Не қиын болды?\n"
-        f"• Қай әдет тұрақты болды?\n"
-        f"• Келесі аптада нені жақсартамын?\n\n"
-        f"Жауабыңды осы хабарламаға жауап ретінде жаз — өзің үшін де, "
-        f"прогресіңді түсіну үшін де пайдалы."
+        f"📊 <b>{week}-АПТА REVIEW</b>\n\n"
+        "Апта аяқталды. 3 сұраққа бір хабарламамен жауап жаз:\n\n"
+        "1) Бұл аптада не жақсы шықты?\n"
+        "2) Не қиын болды?\n"
+        "3) Келесі аптада нені өзгертемін?\n\n"
+        "Жауабыңды осы чатқа жібер (кемі 1–2 сөйлем). Жауабыңа қарап келесі аптаға ұсыныс беремін."
     )
 
 
 async def deadline_advance_job(context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_active_users()
-    for user in users:
+    for user in db.get_all_active_users():
         if not db.needs_advance_today(user):
             continue
         day = user["current_day"]
-        if day > TOTAL_DAYS:
+        uid = user["telegram_id"]
+        if day > TOTAL_DAYS or user["category"] not in PROGRAMS:
             continue
-        cat = CATEGORIES[user["category"]]
-        total_habits = get_total_tasks_for_day(day, cat)
-        completed = len(db.get_completed_habits_today(user["telegram_id"], day))
-
+        done = db.get_done_days(uid)
         try:
-            if completed >= total_habits:
-                await context.bot.send_message(
-                    user["telegram_id"], f"🎉 {day}-күн толық орындалды! Ертең жаңа тапсырмалар келеді."
-                )
+            if day in done:
+                suffix = " (жеңіл нұсқа)" if done[day] != "full" else ""
+                await context.bot.send_message(uid, f"🎉 {day}-күн жабылды{suffix}! Ертең жаңа миссия келеді.")
             else:
                 await context.bot.send_message(
-                    user["telegram_id"],
-                    f"❌ Бүгінгі күн толық аяқталмады ({completed}/{total_habits}). "
-                    f"Ештеңе етпейді, ертең жалғастырамыз — курс тоқтамайды!"
+                    uid,
+                    f"❌ {day}-күн жабылмады. Ештеңе етпейді: ертең таңертең оны жеңіл нұсқамен жауып, "
+                    "тізбекті сақтауға болады."
                 )
-
             if day in WEEKLY_REVIEW_DAYS:
-                await context.bot.send_message(
-                    user["telegram_id"], build_weekly_review_text(day), parse_mode="Markdown"
-                )
+                week = WEEKLY_REVIEW_DAYS[day]
+                await context.bot.send_message(uid, build_weekly_review_text(week), parse_mode=ParseMode.HTML)
+                db.set_awaiting(uid, f"review_{week}")
         except Exception as e:
-            logger.error(f"deadline_advance_job message failed for {user['telegram_id']}: {e}")
+            logger.error(f"deadline_advance_job message failed for {uid}: {e}")
+        db.advance_day(uid)
 
-        db.advance_day(user["telegram_id"])
 
+# ---------- Батырмалар ----------
 
-async def handle_habit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    if query.data == "noop":
-        await query.answer("Бұл тапсырманы фото/текст арқылы орында.", show_alert=True)
-        return
-
-    await query.answer()
-    parts = query.data.split("_")
-    day = int(parts[-1])
-    habit_id = "_".join(parts[1:-1])
-    telegram_id = update.effective_user.id
-
-    user = db.get_user(telegram_id)
-    if not user or user["current_day"] != day:
-        await query.answer("Бұл тапсырма ескірген.", show_alert=True)
-        return
-
-    db.record_habit_checkin(telegram_id, day, habit_id)
-
-    new_keyboard = build_day_keyboard(telegram_id, day, user["category"])
+async def _refresh_keyboard(query, telegram_id: int, day: int, category: str):
     try:
-        await query.edit_message_reply_markup(reply_markup=new_keyboard)
-    except Exception:
+        await query.edit_message_reply_markup(reply_markup=build_day_keyboard(telegram_id, day, category))
+    except TelegramError:
         pass
-    await query.answer("✅ Белгіленді!")
+
+
+async def handle_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = db.get_user(update.effective_user.id)
+    day = None
+    try:
+        day = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        pass
+    if user and day and day in db.get_done_days(user["telegram_id"]):
+        await query.answer("Бұл күн жабылған ✅", show_alert=False)
+    else:
+        await query.answer("Бұл миссияны осы чатқа жауап жазып (мәтін, дауыс немесе фото) жабасың.", show_alert=True)
+
+
+async def handle_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        day = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    user = db.get_user(update.effective_user.id)
+    if not user or user["current_day"] != day or user["category"] not in PROGRAMS:
+        await query.answer("Бұл миссия ескірген.", show_alert=True)
+        return
+    if get_daily_plan(user["category"], day)["proof"] != "button":
+        await query.answer("Бұл миссия жауап жазып жабылады.", show_alert=True)
+        return
+    streak = db.record_checkin(user["telegram_id"], day, mode="full")
+    await query.answer(f"✅ Белгіленді! 🔥 {streak} күн қатарынан")
+    await _refresh_keyboard(query, user["telegram_id"], day, user["category"])
+
+
+async def handle_light_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        day = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    user = db.get_user(update.effective_user.id)
+    if not user or user["current_day"] != day or user["category"] not in PROGRAMS:
+        await query.answer("Бұл миссия ескірген.", show_alert=True)
+        return
+    streak = db.record_checkin(user["telegram_id"], day, mode="light")
+    await query.answer(f"⚡ Жеңіл нұсқа есептелді. 🔥 {streak} күн қатарынан", show_alert=True)
+    await _refresh_keyboard(query, user["telegram_id"], day, user["category"])
+
+
+async def handle_catchup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        day = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    user = db.get_user(update.effective_user.id)
+    if not user or day != user["current_day"] - 1 or day < 1:
+        await query.answer("Бұл күнді енді жабу мүмкін емес.", show_alert=True)
+        return
+    if day in db.get_done_days(user["telegram_id"]):
+        await query.answer("Бұл күн жабылған ✅")
+        return
+    streak = db.record_checkin(user["telegram_id"], day, mode="catchup")
+    await query.answer(f"↩️ Кешегі күн жабылды. 🔥 {streak} күн қатарынан", show_alert=True)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
 
 
 async def handle_plan_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    telegram_id = update.effective_user.id
-    user = db.get_user(telegram_id)
-    if not user:
+    user = db.get_user(update.effective_user.id)
+    if not user or user["category"] not in PROGRAMS:
+        await query.answer()
         return
-    day = int(query.data.split("_")[1])
+    try:
+        day = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
     if user["current_day"] != day:
         await query.answer("Бұл күннің жоспары ескірген.", show_alert=True)
         return
-    plan = get_daily_plan(user["category"], day)
+    r = plan_mod.render_day(get_daily_plan(user["category"], day), user)
     await query.answer()
     await query.message.reply_text(
-        f"🛟 *Жоспар B — {plan['title']}*\n\n{plan['fallback']}\n\n"
-        "Бүгін 100% мінсіз болу міндет емес. Ең кіші нұсқасын орында да, ертең қайта жалғастыр.",
-        parse_mode="Markdown",
+        f"🛟 <b>Жоспар B — {esc(r['title'])}</b>\n\n{esc(r['fallback'])}\n\n"
+        "Бүгін мінсіз болу міндет емес. Ең кіші нұсқасын орында да, «⚡ Жеңіл нұсқаны орындадым» батырмасын бас.",
+        parse_mode=ParseMode.HTML,
     )
+
+
+async def handle_continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    telegram_id = update.effective_user.id
+    if query.data == "continue_yes":
+        db.reset_progress(telegram_id)
+        await query.edit_message_text("Керемет! 1-күннен қайта бастаймыз 💪 /today арқылы көре аласың.")
+    else:
+        db.set_paused(telegram_id, True)
+        await query.edit_message_text("Түсінікті! Курсты аяқтадың. Кез келген уақытта админге жазып қайта бастай аласың. Сау бол! 👋")
+
+
+# ---------- Жауаптар: мәтін, фото, дауыс ----------
+
+async def _forward_to_admins(context: ContextTypes.DEFAULT_TYPE, text: str, user: dict, kind: str = "text", file_id: str = None):
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✉️ Жауап жазу", callback_data=f"admin_msg_{user['telegram_id']}_all_0")
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            if kind == "photo":
+                await context.bot.send_photo(admin_id, file_id, caption=text[:1000], reply_markup=markup)
+            elif kind == "voice":
+                await context.bot.send_voice(admin_id, file_id, caption=text[:1000], reply_markup=markup)
+            else:
+                await context.bot.send_message(admin_id, text[:4000], reply_markup=markup)
+        except TelegramError as e:
+            logger.error(f"forward to admin {admin_id} failed: {e}")
+
+
+def _user_tag(user: dict) -> str:
+    username = f"@{user['username']}" if user.get("username") else "username жоқ"
+    return f"{user['full_name']} ({username}, id: {user['telegram_id']})"
+
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Алдымен /start арқылы тіркел.")
+        return
+    await _start_support(update.message, user)
+
+
+async def _start_support(message, user: dict):
+    if not ADMIN_IDS:
+        await message.reply_text("Қазір куратор қолжетімсіз. Кейінірек қайталап көр.")
+        return
+    db.set_awaiting(user["telegram_id"], "support")
+    await message.reply_text(
+        "Сұрағыңды немесе мәселеңді келесі хабарламамен жаз (мәтін, дауыс немесе фото) — куратор көреді. 📩",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Болдырмау", callback_data="support_cancel")]]),
+    )
+
+
+async def handle_support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        return
+    if query.data == "support_cancel":
+        db.set_awaiting(user["telegram_id"], "")
+        await query.edit_message_text("Жақсы, болдырмадым.")
+        return
+    await _start_support(query.message, user)
+
+
+async def handle_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    # Админ клиентке хабар жазып жатқан режим
+    target = context.user_data.get("admin_msg_to")
+    if is_admin(telegram_id) and target:
+        context.user_data.pop("admin_msg_to", None)
+        try:
+            await context.bot.send_message(target, f"💬 <b>Куратордан:</b>\n{esc(text)}", parse_mode=ParseMode.HTML)
+            await update.message.reply_text("✅ Хабар клиентке жіберілді.")
+        except TelegramError as e:
+            await update.message.reply_text(f"⚠️ Жіберілмеді: {e}")
+        return
+
+    user = db.get_user(telegram_id)
+    if not user:
+        await update.message.reply_text("Тіркелу үшін /start жаз.")
+        return
+
+    awaiting = user.get("awaiting") or ""
+    if awaiting == "support":
+        db.set_awaiting(telegram_id, "")
+        await _forward_to_admins(context, f"📩 Қолдау: {_user_tag(user)}\n{user['current_day']}-күн\n\n{text}", user)
+        await update.message.reply_text("✅ Куратор көрді, жауап береді. Бұл арада миссияңды жалғастыра бер.")
+        return
+
+    if awaiting.startswith("review_"):
+        await _handle_review_reply(update, user, awaiting, text)
+        return
+
+    await _handle_mission_text(update, context, user, text)
+
+
+async def _handle_review_reply(update: Update, user: dict, awaiting: str, text: str):
+    try:
+        week = int(awaiting.split("_")[1])
+    except (IndexError, ValueError):
+        db.set_awaiting(user["telegram_id"], "")
+        return
+    if len(text) < 20:
+        await update.message.reply_text("Жауап тым қысқа: кемі 1–2 сөйлем жаз. Үш сұраққа жауап бер.")
+        return
+    uid = user["telegram_id"]
+    db.record_checkin(uid, week * 7, habit_id=f"review_{week}", text_response=text)
+    db.set_awaiting(uid, "")
+    done_days = db.get_done_days(uid)
+    done, light, elapsed = plan_mod.week_done_counts(done_days, week, week * 7)
+    next_goal = PROGRAMS[user["category"]]["weeks"][week]["goal"] if week < 4 and user["category"] in PROGRAMS else ""
+    light_part = f" (оның {light}-і жеңіл нұсқа)" if light else ""
+    await update.message.reply_text(
+        f"✅ Review қабылданды. Осы аптада {elapsed} күннің {done}-і жабылды{light_part}.\n\n"
+        + plan_mod.adaptation_text(done, elapsed, next_goal)
+    )
+
+
+async def _handle_mission_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, text: str):
+    uid = user["telegram_id"]
+    day = user["current_day"]
+    if user["paused"]:
+        await update.message.reply_text("Курсың қазір паузада. Қайта қосу үшін /support жаз.")
+        return
+    if day > TOTAL_DAYS or user["category"] not in PROGRAMS:
+        return
+    plan = get_daily_plan(user["category"], day)
+    r = plan_mod.render_day(plan, user)
+
+    if r["proof"] == "photo":
+        await update.message.reply_text("Бүгінгі миссия фотомен жабылады 📸 — суретті осы чатқа жібер.")
+        return
+    if r["proof"] == "button":
+        await update.message.reply_text("Бүгінгі миссия батырмамен жабылады ✅ — /today арқылы ашып, «Орындадым» бас.")
+        return
+    if len(text) < r["min"]:
+        await update.message.reply_text(
+            f"Жауап тым қысқа (кемі {r['min']} таңба). Формат: {r['ask']}\n\n"
+            "Егер бұл миссияға жауап емес, сұрағың болса — /support."
+        )
+        return
+
+    already = day in db.get_done_days(uid)
+    streak = db.record_checkin(uid, day, text_response=text, mode="full")
+    msg = "✅ Жауабың жаңартылды." if already else f"✅ Жауабың қабылданды! 🔥 {streak} күн қатарынан."
+    if r["save"]:
+        msg += f"\n🧩 «{r['save']}» «Менің жүйем» құжатыңа сақталды (/system)."
+    await update.message.reply_text(msg)
+
+    if day == TOTAL_DAYS:
+        for chunk in plan_mod.compile_system(db.get_user(uid), PROGRAMS, db.get_text_responses(uid), CATEGORIES[user["category"]]["name"]):
+            await context.bot.send_message(uid, chunk)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -578,88 +964,85 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(telegram_id)
     if not user:
         return
-
-    day = user["current_day"]
-    plan = get_daily_plan(user["category"], day)
-    if plan["proof"] != "photo":
+    file_id = update.message.photo[-1].file_id
+    awaiting = user.get("awaiting") or ""
+    if awaiting == "support":
+        db.set_awaiting(telegram_id, "")
+        await _forward_to_admins(context, f"📩 Қолдау (фото): {_user_tag(user)}", user, kind="photo", file_id=file_id)
+        await update.message.reply_text("✅ Куратор көрді, жауап береді.")
         return
 
-    file_id = update.message.photo[-1].file_id
-    streak = db.record_habit_checkin(telegram_id, day, "daily_plan", proof_file_id=file_id)
+    day = user["current_day"]
+    if user["paused"] or day > TOTAL_DAYS or user["category"] not in PROGRAMS:
+        return
+    plan = get_daily_plan(user["category"], day)
+    if plan["proof"] != "photo":
+        await update.message.reply_text("Бүгінгі миссия фотомен жабылмайды. Миссияны көру: /today. Куратормен байланыс: /support.")
+        return
 
-    await update.message.reply_text(f"✅ Фото қабылданды! 🔥 {streak} күн тоқтаусыз.")
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_photo(
-                admin_id, file_id,
-                caption=f"📸 {user['full_name']} (@{user['username']}) — {day}-күн, {plan['title']}"
-            )
-        except Exception:
-            pass
+    streak = db.record_checkin(telegram_id, day, proof_file_id=file_id, mode="full")
+    await update.message.reply_text(f"✅ Фото қабылданды! 🔥 {streak} күн қатарынан.")
+    await _forward_to_admins(context, f"📸 {_user_tag(user)} — {day}-күн, {plan['title']}", user, kind="photo", file_id=file_id)
 
 
-async def handle_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     user = db.get_user(telegram_id)
     if not user:
         return
-
-    day = user["current_day"]
-    plan = get_daily_plan(user["category"], day)
-    if plan["proof"] != "text":
+    file_id = update.message.voice.file_id
+    awaiting = user.get("awaiting") or ""
+    if awaiting == "support":
+        db.set_awaiting(telegram_id, "")
+        await _forward_to_admins(context, f"📩 Қолдау (дауыс): {_user_tag(user)}", user, kind="voice", file_id=file_id)
+        await update.message.reply_text("✅ Куратор тыңдап, жауап береді.")
         return
 
-    streak = db.record_habit_checkin(telegram_id, day, "daily_plan", text_response=update.message.text)
-    await update.message.reply_text(f"✅ Жауабың қабылданды! 🔥 {streak} күн тоқтаусыз.")
+    day = user["current_day"]
+    if user["paused"] or day > TOTAL_DAYS or user["category"] not in PROGRAMS:
+        return
+    plan = get_daily_plan(user["category"], day)
+    if plan["proof"] != "text":
+        await update.message.reply_text("Бүгінгі миссия дауыстық жауаппен жабылмайды. Миссияны көру: /today.")
+        return
+    streak = db.record_checkin(telegram_id, day, proof_file_id=file_id, text_response="🎤 дауыстық жауап (куратор тыңдайды)", mode="full")
+    await update.message.reply_text(f"✅ Дауыстық жауабың қабылданды! 🔥 {streak} күн қатарынан.")
+    await _forward_to_admins(context, f"🎤 {_user_tag(user)} — {day}-күн, {plan['title']}", user, kind="voice", file_id=file_id)
 
 
-async def handle_continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    telegram_id = update.effective_user.id
-
-    if query.data == "continue_yes":
-        db.reset_progress(telegram_id)
-        await query.edit_message_text("Керемет! 1-күннен қайта бастаймыз 💪 /today арқылы көре аласың.")
-    else:
-        db.set_paused(telegram_id, True)
-        await query.edit_message_text(
-            "Түсінікті! Курсты аяқтадың. Кез келген уақытта /start арқылы қайта бастай аласың. Сау бол! 👋"
-        )
-
+# ---------- Прогресс, жүйе, сабақтар ----------
 
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(update.effective_user.id)
-    if not user:
+    if not user or user["category"] not in PROGRAMS:
         await update.message.reply_text("Алдымен /start арқылы тіркел.")
         return
-
-    filled = int((user["current_day"] / TOTAL_DAYS) * 12)
+    day = min(user["current_day"], TOTAL_DAYS)
+    done = db.get_done_days(user["telegram_id"])
+    streak = db.compute_streak(done.keys(), user["current_day"])
+    light = sum(1 for m in done.values() if m != "full")
+    filled = round(len(done) / TOTAL_DAYS * 12)
     bar = "█" * filled + "░" * (12 - filled)
-    percent = round((user["current_day"] / TOTAL_DAYS) * 100)
     cat_name = CATEGORIES[user["category"]]["name"]
-
+    week = plan_mod.week_of(day)
+    w_done, w_light, w_elapsed = plan_mod.week_done_counts(done, week, user["current_day"])
     await update.message.reply_text(
-        f"📊 *Сенің прогресің*\n\n{bar} {percent}%\n\n"
-        f"📅 Күн: {user['current_day']}/{TOTAL_DAYS}\n🎯 Бағыт: {cat_name}\n"
-        f"🔥 {user['streak']} күн тоқтаусыз\n📝 Мақсатың: {user['goal']}",
-        parse_mode="Markdown",
+        f"📊 Сенің прогресің\n\n{bar} {len(done)}/{TOTAL_DAYS} күн жабылды\n\n"
+        f"📅 Күн: {day}/{TOTAL_DAYS} · {week}-апта: {w_done}/{w_elapsed}\n"
+        f"🎯 Бағыт: {cat_name}\n"
+        f"🔥 {streak} күн қатарынан" + (f" · ⚡ жеңіл нұсқа: {light}" if light else "") + "\n"
+        f"📝 Мақсатың: {user['goal']}\n\n"
+        "Жауаптарың: /system"
     )
 
 
-async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text("Сұрағың болса, осы хабарламаға жауап ретінде жаз — админге тікелей жіберемін. 📩")
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                admin_id,
-                f"📩 Қолдау сұранысы: {user.full_name} (@{user.username}, id: {user.id})\n"
-                f"/user {user.id} арқылы қарай аласың."
-            )
-        except Exception:
-            pass
+async def system_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user or user["category"] not in PROGRAMS:
+        await update.message.reply_text("Алдымен /start арқылы тіркел.")
+        return
+    for chunk in plan_mod.compile_system(user, PROGRAMS, db.get_text_responses(user["telegram_id"]), CATEGORIES[user["category"]]["name"]):
+        await update.message.reply_text(chunk)
 
 
 async def lessons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,8 +1055,8 @@ async def lessons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         keyboard.append(row)
     await update.message.reply_text(
-        "📚 *Видео сабақтар каталогы*\n\nНөмірді бас:",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard),
+        "📚 Видео сабақтар каталогы\n\nНөмірді бас:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -686,32 +1069,52 @@ async def handle_lesson_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(f"{lesson['title']}\n\n▶️ {lesson['link']}")
 
 
+# ---------- Админ ----------
+
 ADMIN_PAGE_SIZE = 6
 
 
-def get_admin_user_snapshot(user: dict) -> dict:
-    """Админге сандар емес, клиентпен не істеу керегін көрсететін қысқа күй."""
+def get_admin_user_snapshot(user: dict, now: datetime = None, done: dict = None) -> dict:
+    """Админге сан емес, клиентпен не істеу керегін көрсететін күй. Уақытты ескереді:
+    күн басында «әлі орындамады» деп қызыл шығармайды."""
+    now = now or datetime.now(ALMATY_TZ)
+    uid = user["telegram_id"]
     day = user["current_day"]
+    done = db.get_done_days(uid) if done is None else done
+    streak = db.compute_streak(done.keys(), day)
+    base = {"streak": streak, "done_total": len(done), "today_done": day in done, "mode": done.get(day)}
+
     if user["paused"]:
-        return {"label": "⏸ Паузада", "priority": "paused", "completed": 0, "total": 0}
+        return {**base, "label": "⏸ Паузада", "priority": "paused"}
     if day > TOTAL_DAYS:
-        return {"label": "🏁 Курс аяқталды", "priority": "done", "completed": 0, "total": 0}
+        return {**base, "label": "🏁 Курс аяқталды", "priority": "done"}
 
-    cat = CATEGORIES.get(user["category"], {})
-    total = get_total_tasks_for_day(day, cat) if cat else 0
-    completed = len(db.get_completed_habits_today(user["telegram_id"], day))
-    if not user["last_checkin_date"] and day <= 1:
-        label, priority = "🆕 Жаңа қатысушы", "new"
-    elif completed == 0:
-        label, priority = "🔴 Бүгін байланыс керек", "red"
-    elif completed < total:
-        label, priority = "🟡 Бүгін аяқтамаған", "yellow"
-    else:
-        label, priority = "🟢 Бүгін орындаған", "green"
-    return {"label": label, "priority": priority, "completed": completed, "total": total}
+    week = plan_mod.week_of(day)
+    w_done, w_light, w_elapsed = plan_mod.week_done_counts(done, week, day)
+    base.update({"week_done": w_done, "week_light": w_light, "week_elapsed": w_elapsed})
+
+    missed_run = 0
+    for d in range(day - 1, 0, -1):
+        if d in done:
+            break
+        missed_run += 1
+    base["missed_run"] = missed_run
+
+    if day in done:
+        label = "🟢 Бүгін жеңіл нұсқа" if done[day] != "full" else "🟢 Бүгін орындады"
+        return {**base, "label": label, "priority": "green"}
+    if day == 1 and not done:
+        return {**base, "label": "🆕 Жаңа қатысушы", "priority": "new"}
+    if missed_run >= 2:
+        return {**base, "label": f"🔴 {missed_run} күн өткізді — жазу керек", "priority": "red"}
+    if missed_run == 1:
+        return {**base, "label": "🟡 Кеше өткізді", "priority": "yellow"}
+    if now.hour >= 18:
+        return {**base, "label": "🟡 Бүгін әлі жасамады", "priority": "yellow"}
+    return {**base, "label": "⚪ Күн жүріп жатыр", "priority": "ok"}
 
 
-def get_admin_users(filter_name: str = "all") -> list[dict]:
+def get_admin_users(filter_name: str = "all") -> list:
     users = db.get_all_users()
     if filter_name == "attention":
         return [u for u in users if get_admin_user_snapshot(u)["priority"] in {"red", "yellow"}]
@@ -720,19 +1123,20 @@ def get_admin_users(filter_name: str = "all") -> list[dict]:
     return users
 
 
-def build_admin_dashboard() -> tuple[str, InlineKeyboardMarkup]:
+def build_admin_dashboard():
     users = db.get_all_users()
     snapshots = [get_admin_user_snapshot(u) for u in users]
     attention = sum(s["priority"] in {"red", "yellow"} for s in snapshots)
     new_users = sum(s["priority"] == "new" for s in snapshots)
     completed_today = sum(s["priority"] == "green" for s in snapshots)
     text = (
-        "👑 *TARTIP ADMIN — бүгінгі басқару*\n\n"
-        f"🔴🟡 Назар керек: *{attention}*\n"
-        f"🆕 Жаңа қатысушы: *{new_users}*\n"
-        f"🟢 Бүгін жоспарды орындаған: *{completed_today}*\n"
-        f"👥 Барлық клиент: *{len(users)}*\n\n"
-        "Төменнен адамды аш: әр карточкада бүгінгі орындалуы, мақсаты және бірден әрекет ету батырмалары бар."
+        "👑 TARTIP ADMIN — бүгінгі басқару\n\n"
+        f"🔴🟡 Назар керек: {attention}\n"
+        f"🆕 Жаңа қатысушы: {new_users}\n"
+        f"🟢 Бүгін миссияны орындаған: {completed_today}\n"
+        f"👥 Барлық клиент: {len(users)}\n\n"
+        "Төменнен адамды аш: карточкада мақсаты, апталық орындалуы, соңғы жауаптары және "
+        "бірден әрекет ету батырмалары бар."
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔴🟡 Назар керек ({attention})", callback_data="admin_list_attention_0")],
@@ -743,18 +1147,18 @@ def build_admin_dashboard() -> tuple[str, InlineKeyboardMarkup]:
     return text, keyboard
 
 
-def build_admin_list(filter_name: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+def build_admin_list(filter_name: str, page: int):
     users = get_admin_users(filter_name)
     max_page = max(0, (len(users) - 1) // ADMIN_PAGE_SIZE)
     page = max(0, min(page, max_page))
     shown = users[page * ADMIN_PAGE_SIZE:(page + 1) * ADMIN_PAGE_SIZE]
     titles = {"all": "👥 Барлық клиенттер", "attention": "🔴🟡 Назар керек", "new": "🆕 Жаңа қатысушылар"}
-    text = f"{titles[filter_name]}\n\nАдамды басып, толық картасын аш. {len(users)} адам · {page + 1}/{max_page + 1} бет"
+    text = f"{titles.get(filter_name, '👥')}\n\nАдамды басып, толық картасын аш. {len(users)} адам · {page + 1}/{max_page + 1} бет"
     keyboard = []
     for user in shown:
         snapshot = get_admin_user_snapshot(user)
         name = user["full_name"] or "Аты жазылмаған"
-        label = f"{snapshot['label']} · {name} · {user['current_day']}/{TOTAL_DAYS}"
+        label = f"{snapshot['label']} · {name} · {min(user['current_day'], TOTAL_DAYS)}/{TOTAL_DAYS}"
         keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"admin_user_{user['telegram_id']}_{filter_name}_{page}")])
     navigation = []
     if page > 0:
@@ -767,54 +1171,105 @@ def build_admin_list(filter_name: str, page: int) -> tuple[str, InlineKeyboardMa
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def build_admin_user_card(user: dict, filter_name: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+def _recent_answers(user: dict, limit: int = 3) -> list:
+    rows = db.get_text_responses(user["telegram_id"])[-limit:]
+    result = []
+    for row in rows:
+        title = ""
+        if user["category"] in PROGRAMS and 1 <= row["day"] <= TOTAL_DAYS:
+            title = get_daily_plan(user["category"], row["day"])["title"]
+        text = " ".join((row["text_response"] or "").split())
+        result.append(f"{row['day']}-күн · {title}: {text[:180]}{'…' if len(text) > 180 else ''}")
+    return result
+
+
+def build_admin_user_card(user: dict, filter_name: str, page: int):
     snapshot = get_admin_user_snapshot(user)
     category_name = CATEGORIES.get(user["category"], {}).get("name", "Белгісіз бағыт")
     username = f"@{user['username']}" if user.get("username") else "username жоқ"
-    progress = "Курс аяқталды" if user["current_day"] > TOTAL_DAYS else f"{snapshot['completed']}/{snapshot['total']} тапсырма"
-    last_checkin = user["last_checkin_date"] or "Әлі check-in жоқ"
-    text = (
-        f"👤 {user['full_name']} ({username})\n\n"
-        f"Күйі: {snapshot['label']}\n"
-        f"Бағыты: {category_name}\n"
-        f"Мақсаты: {user['goal']}\n"
-        f"Неге келді: {user.get('goal_why') or 'жазылмаған'}\n\n"
-        f"📅 Күн: {user['current_day']}/{TOTAL_DAYS}\n"
-        f"✅ Бүгін: {progress}\n"
-        f"🔥 Қатарынан: {user['streak']} күн\n"
-        f"🕓 Соңғы белгі: {last_checkin}\n"
-        f"ID: {user['telegram_id']}"
-    )
+    day = min(user["current_day"], TOTAL_DAYS)
+
+    if user["current_day"] > TOTAL_DAYS:
+        today_line = "Курс аяқталды"
+    elif snapshot.get("today_done"):
+        today_line = "орындалды (жеңіл нұсқа)" if snapshot["mode"] != "full" else "орындалды"
+    else:
+        today_line = "әлі орындалмаған"
+
+    values = plan_mod.profile_values(user)
+    profile_bits = [f"ояну {values['wake']}", f"жату {values['bed']}"]
+    if user.get("meals"):
+        profile_bits.append(f"{user['meals']} ас")
+    if user.get("place"):
+        profile_bits.append("залда" if user["place"] == "gym" else "үйде")
+    restr = (user.get("restrictions") or "").strip()
+    if restr and restr.lower() not in plan_mod.NO_RESTRICTION_WORDS:
+        profile_bits.append(f"шектеу: {restr}")
+    flags = []
+    if user.get("health_flag") == "yes":
+        flags.append("⚕️ денсаулық белгісі бар (диагноз жоқ)")
+    if user.get("adult") == "no":
+        flags.append("🔞 18-ге толмаған")
+
+    lines = [
+        f"👤 {user['full_name']} ({username})",
+        "",
+        f"Күйі: {snapshot['label']}",
+        f"Бағыты: {category_name}",
+        f"Мақсаты: {user['goal']}",
+        f"Неге келді: {user.get('goal_why') or 'жазылмаған'}",
+        "",
+        f"🧾 Профиль: {', '.join(profile_bits)}",
+    ]
+    lines.extend(flags)
+    lines.append("")
+    lines.append(f"📅 Күн: {day}/{TOTAL_DAYS}")
+    if "week_done" in snapshot:
+        light = f" (жеңіл: {snapshot['week_light']})" if snapshot["week_light"] else ""
+        lines.append(f"🗓 Осы апта: {snapshot['week_done']}/{snapshot['week_elapsed']}{light}")
+    lines.append(f"✅ Бүгін: {today_line}")
+    lines.append(f"🔥 Қатарынан: {snapshot['streak']} күн · барлығы жабылған: {snapshot['done_total']}/{TOTAL_DAYS}")
+    lines.append(f"🕓 Соңғы белгі: {user['last_checkin_date'] or 'әлі жоқ'}")
+    answers = _recent_answers(user)
+    if answers:
+        lines.append("")
+        lines.append("💬 Соңғы жауаптары:")
+        lines.extend(f"• {a}" for a in answers)
+    lines.append(f"\nID: {user['telegram_id']}")
+
     action = "▶️ Қайта қосу" if user["paused"] else "⏸ Паузаға қою"
+    suffix = f"{user['telegram_id']}_{filter_name}_{page}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(action, callback_data=f"admin_toggle_{user['telegram_id']}_{filter_name}_{page}")],
-        [InlineKeyboardButton("🔄 Прогресті 1-күнге қайтару", callback_data=f"admin_reset_{user['telegram_id']}_{filter_name}_{page}")],
+        [InlineKeyboardButton("✉️ Хабар жазу", callback_data=f"admin_msg_{suffix}"),
+         InlineKeyboardButton("📨 Апталық қорытынды", callback_data=f"admin_weekly_{suffix}")],
+        [InlineKeyboardButton("📝 Барлық жауаптары", callback_data=f"admin_answers_{suffix}")],
+        [InlineKeyboardButton(action, callback_data=f"admin_toggle_{suffix}")],
+        [InlineKeyboardButton("🔄 Прогресті 1-күнге қайтару", callback_data=f"admin_reset_{suffix}")],
         [InlineKeyboardButton("◀️ Каталогқа оралу", callback_data=f"admin_list_{filter_name}_{page}")],
         [InlineKeyboardButton("🏠 Админ мәзірі", callback_data="admin_home")],
     ])
-    return text, keyboard
+    return "\n".join(lines)[:4000], keyboard
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     text, keyboard = build_admin_dashboard()
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админге командаларды есте сақтамай, каталог арқылы басқаруға мүмкіндік береді."""
     query = update.callback_query
     if not is_admin(query.from_user.id):
         await query.answer("Бұл бөлім тек админге арналған.", show_alert=True)
         return
     await query.answer()
     parts = query.data.split("_")
-    action = parts[1]
+    action = parts[1] if len(parts) > 1 else ""
 
     if action == "home":
         text, keyboard = build_admin_dashboard()
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query.edit_message_text(text, reply_markup=keyboard)
         return
     if action == "stats":
         s = db.get_stats()
@@ -824,16 +1279,71 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Админ мәзірі", callback_data="admin_home")]]),
         )
         return
+    if action == "cancelmsg":
+        context.user_data.pop("admin_msg_to", None)
+        await query.edit_message_text("Болдырмадым.")
+        return
     if action == "list":
-        filter_name, page = parts[2], int(parts[3])
+        try:
+            filter_name, page = parts[2], int(parts[3])
+        except (IndexError, ValueError):
+            return
         text, keyboard = build_admin_list(filter_name, page)
         await query.edit_message_text(text, reply_markup=keyboard)
         return
 
-    telegram_id, filter_name, page = int(parts[2]), parts[3], int(parts[4])
+    try:
+        telegram_id, filter_name, page = int(parts[2]), parts[3], int(parts[4])
+    except (IndexError, ValueError):
+        return
     user = db.get_user(telegram_id)
     if not user:
         await query.edit_message_text("Клиент табылмады. Ол өшірілген болуы мүмкін.")
+        return
+    suffix = f"{telegram_id}_{filter_name}_{page}"
+
+    if action == "msg":
+        context.user_data["admin_msg_to"] = telegram_id
+        await query.message.reply_text(
+            f"✉️ {user['full_name']} клиентке жазатын хабарыңды келесі хабарламамен жібер.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Болдырмау", callback_data="admin_cancelmsg")]]),
+        )
+        return
+    if action == "weekly":
+        done = db.get_done_days(telegram_id)
+        draft = plan_mod.weekly_draft(user, done, db.compute_streak(done.keys(), user["current_day"]))
+        await query.message.reply_text(
+            f"📨 Апталық қорытынды жобасы ({user['full_name']}):\n\n{draft}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Осылай жіберу", callback_data=f"admin_sendweekly_{suffix}")],
+                [InlineKeyboardButton("✏️ Өзім жазамын", callback_data=f"admin_msg_{suffix}")],
+            ]),
+        )
+        return
+    if action == "sendweekly":
+        done = db.get_done_days(telegram_id)
+        draft = plan_mod.weekly_draft(user, done, db.compute_streak(done.keys(), user["current_day"]))
+        try:
+            await context.bot.send_message(telegram_id, f"💬 <b>Куратордан:</b>\n{esc(draft)}", parse_mode=ParseMode.HTML)
+            await query.edit_message_text(f"✅ Жіберілді ({user['full_name']}):\n\n{draft}")
+        except TelegramError as e:
+            await query.edit_message_text(f"⚠️ Жіберілмеді: {e}")
+        return
+    if action == "answers":
+        rows = db.get_text_responses(telegram_id)[-8:]
+        reviews = db.get_reviews(telegram_id)
+        lines = [f"📝 {user['full_name']} — соңғы жауаптары\n"]
+        for row in rows:
+            title = get_daily_plan(user["category"], row["day"])["title"] if user["category"] in PROGRAMS else ""
+            lines.append(f"{row['day']}-күн · {title}:\n{' '.join((row['text_response'] or '').split())[:400]}\n")
+        for rev in reviews[-2:]:
+            lines.append(f"📊 {rev['habit_id']}:\n{' '.join((rev['text_response'] or '').split())[:400]}\n")
+        if len(lines) == 1:
+            lines.append("Әзірге жазбаша жауап жоқ.")
+        await query.edit_message_text(
+            "\n".join(lines)[:4000],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Карточкаға оралу", callback_data=f"admin_user_{suffix}")]]),
+        )
         return
     if action == "toggle":
         db.set_paused(telegram_id, not bool(user["paused"]))
@@ -841,10 +1351,10 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "reset":
         await query.edit_message_text(
             f"⚠️ {user['full_name']} клиентінің прогресін 1-күнге қайтару керек пе?\n"
-            "Барлық бұрынғы орындалған тапсырмалар өшеді.",
+            "Барлық бұрынғы орындалған миссиялар мен жауаптар өшеді.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Иә, прогресті нөлдеу", callback_data=f"admin_confirmreset_{telegram_id}_{filter_name}_{page}")],
-                [InlineKeyboardButton("Жоқ, клиент картасына оралу", callback_data=f"admin_user_{telegram_id}_{filter_name}_{page}")],
+                [InlineKeyboardButton("Иә, прогресті нөлдеу", callback_data=f"admin_confirmreset_{suffix}")],
+                [InlineKeyboardButton("Жоқ, клиент картасына оралу", callback_data=f"admin_user_{suffix}")],
             ]),
         )
         return
@@ -855,92 +1365,118 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(text, reply_markup=keyboard)
 
 
+async def admin_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """Күнде бір рет: кімге назар керек екенін админге жібереді."""
+    if not ADMIN_IDS:
+        return
+    users = db.get_all_users()
+    snaps = [(u, get_admin_user_snapshot(u)) for u in users]
+    red = [u for u, s in snaps if s["priority"] == "red"]
+    yellow = [u for u, s in snaps if s["priority"] == "yellow"]
+    new = [u for u, s in snaps if s["priority"] == "new"]
+    if not (red or yellow or new):
+        return
+    lines = ["🗞 TARTIP күндік дайджест\n"]
+    if red:
+        lines.append("🔴 Жазу керек:")
+        lines.extend(f"— {u['full_name']} · {min(u['current_day'], TOTAL_DAYS)}-күн · id {u['telegram_id']}" for u in red[:15])
+    if yellow:
+        lines.append("\n🟡 Назар аудар:")
+        lines.extend(f"— {u['full_name']} · {min(u['current_day'], TOTAL_DAYS)}-күн · id {u['telegram_id']}" for u in yellow[:15])
+    if new:
+        lines.append(f"\n🆕 Жаңа қатысушылар: {len(new)}")
+    lines.append("\nТолық каталог: /admin")
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, "\n".join(lines)[:4000])
+        except TelegramError as e:
+            logger.error(f"digest failed for {admin_id}: {e}")
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     s = db.get_stats()
     await update.message.reply_text(
-        f"📊 *Статистика*\n\nБарлығы: {s['total']}\nАктивті: {s['active']}\n"
-        f"Тоқтатылған: {s['paused']}\nОрташа streak: {s['avg_streak']}",
-        parse_mode="Markdown",
+        f"📊 Статистика\n\nБарлығы: {s['total']}\nАктивті: {s['active']}\n"
+        f"Тоқтатылған: {s['paused']}\nОрташа қатарынан: {s['avg_streak']} күн"
     )
 
 
 async def problems_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    cats = db.categorize_users()
-    if not cats["red"] and not cats["yellow"]:
-        await update.message.reply_text("Проблемалы клиент жоқ 👍")
+    snaps = [(u, get_admin_user_snapshot(u)) for u in db.get_all_users()]
+    red = [u for u, s in snaps if s["priority"] == "red"]
+    yellow = [u for u, s in snaps if s["priority"] == "yellow"]
+    if not red and not yellow:
+        await update.message.reply_text("Назар керек клиент жоқ 👍")
         return
     lines = []
-    if cats["red"]:
-        lines.append("🔴 *Араласу керек:*")
-        for u in cats["red"]:
-            lines.append(f"— {u['full_name']} (@{u['username']}) — {u['current_day']}-күн, id: {u['telegram_id']}")
-    if cats["yellow"]:
-        lines.append("\n🟡 *Назар керек:*")
-        for u in cats["yellow"]:
-            lines.append(f"— {u['full_name']} (@{u['username']}) — {u['current_day']}-күн, id: {u['telegram_id']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    if red:
+        lines.append("🔴 Араласу керек:")
+        lines.extend(f"— {u['full_name']} (@{u.get('username') or '-'}) — {min(u['current_day'], TOTAL_DAYS)}-күн, id: {u['telegram_id']}" for u in red)
+    if yellow:
+        lines.append("\n🟡 Назар керек:")
+        lines.extend(f"— {u['full_name']} (@{u.get('username') or '-'}) — {min(u['current_day'], TOTAL_DAYS)}-күн, id: {u['telegram_id']}" for u in yellow)
+    await update.message.reply_text("\n".join(lines)[:4000])
 
 
 async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not context.args:
+    target_id = parse_id(context.args)
+    if target_id is None:
         await update.message.reply_text("Қолдану: /user <telegram_id>")
         return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("telegram_id сан болу керек.")
-        return
-
     user = db.get_user(target_id)
     if not user:
         await update.message.reply_text("Клиент табылмады.")
         return
-
-    cat_name = CATEGORIES.get(user["category"], {}).get("name", "?")
-    status = "Тоқтатылған" if user["paused"] else ("Активті" if user["is_active"] else "Белсенді емес")
-    await update.message.reply_text(
-        f"👤 *{user['full_name']}* (@{user['username']})\n\n"
-        f"Бағыт: {cat_name}\nМақсаты: {user['goal']}\nСебебі: {user.get('goal_why', '-')}\n"
-        f"Ағымдағы күн: {user['current_day']}/{TOTAL_DAYS}\n🔥 {user['streak']} күн тоқтаусыз\n"
-        f"Соңғы check-in: {user['last_checkin_date']}\nСтатус: {status}",
-        parse_mode="Markdown",
-    )
+    text, keyboard = build_admin_user_card(user, "all", 0)
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not context.args:
+    target_id = parse_id(context.args)
+    if target_id is None:
         await update.message.reply_text("Қолдану: /pause <telegram_id>")
         return
-    db.set_paused(int(context.args[0]), True)
-    await update.message.reply_text(f"⏸ {context.args[0]} тоқтатылды.")
+    db.set_paused(target_id, True)
+    await update.message.reply_text(f"⏸ {target_id} тоқтатылды.")
 
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not context.args:
+    target_id = parse_id(context.args)
+    if target_id is None:
         await update.message.reply_text("Қолдану: /resume <telegram_id>")
         return
-    db.set_paused(int(context.args[0]), False)
-    await update.message.reply_text(f"▶️ {context.args[0]} қайта қосылды.")
+    db.set_paused(target_id, False)
+    await update.message.reply_text(f"▶️ {target_id} қайта қосылды.")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not context.args:
+    target_id = parse_id(context.args)
+    if target_id is None:
         await update.message.reply_text("Қолдану: /reset <telegram_id>")
         return
-    db.reset_progress(int(context.args[0]))
-    await update.message.reply_text(f"🔄 {context.args[0]} прогресі 1-күнге нөлделді.")
+    user = db.get_user(target_id)
+    if not user:
+        await update.message.reply_text("Клиент табылмады.")
+        return
+    await update.message.reply_text(
+        f"⚠️ {user['full_name']} клиентінің прогресі мен жауаптары өшеді. Растайсың ба?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Иә, нөлдеу", callback_data=f"admin_confirmreset_{target_id}_all_0"),
+            InlineKeyboardButton("Жоқ", callback_data="admin_home"),
+        ]]),
+    )
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -960,6 +1496,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Broadcast failed for {u['telegram_id']}: {e}")
     await update.message.reply_text(f"Жіберілді: {sent}/{len(users)}")
 
+
+# ---------- Іске қосу ----------
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -983,13 +1521,8 @@ async def post_init(application: Application):
     await setup_menus(application)
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN орнатылмаған! .env файлын тексер.")
-
-    db.init_db()
-
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+def build_application(token: str) -> Application:
+    application = Application.builder().token(token).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -997,53 +1530,60 @@ def main():
             ASKING_CATEGORY: [CallbackQueryHandler(category_chosen, pattern=r"^cat_")],
             ASKING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_goal)],
             ASKING_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_why)],
-            ASKING_WHY: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_registration)],
+            ASKING_WHY: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_intake)],
+            INTAKE: [
+                CallbackQueryHandler(intake_answer, pattern=r"^in_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, intake_answer),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     application.add_handler(conv_handler)
 
-    application.add_handler(CommandHandler("today", today_command))
-    application.add_handler(CommandHandler("roadmap", roadmap_command))
-    application.add_handler(CommandHandler("progress", progress_command))
-    application.add_handler(CommandHandler("support", support_command))
-    application.add_handler(CommandHandler("lessons", lessons_command))
-    application.add_handler(CommandHandler("whoami", whoami_command))
-    application.add_handler(CommandHandler("forget", forget_command))
-    application.add_handler(CommandHandler("wipe", wipe_command))
+    for name, handler in [
+        ("today", today_command), ("roadmap", roadmap_command), ("progress", progress_command),
+        ("system", system_command), ("support", support_command), ("lessons", lessons_command),
+        ("whoami", whoami_command), ("forget", forget_command), ("wipe", wipe_command),
+        ("admin", admin_panel), ("stats", stats_command), ("problems", problems_command),
+        ("user", user_command), ("pause", pause_command), ("resume", resume_command),
+        ("reset", reset_command), ("broadcast", broadcast_command),
+    ]:
+        application.add_handler(CommandHandler(name, handler))
 
-    application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^habit_"))
-    application.add_handler(CallbackQueryHandler(handle_habit_callback, pattern=r"^noop$"))
+    application.add_handler(CallbackQueryHandler(handle_noop_callback, pattern=r"^noop_"))
+    application.add_handler(CallbackQueryHandler(handle_done_callback, pattern=r"^done_"))
+    application.add_handler(CallbackQueryHandler(handle_light_callback, pattern=r"^light_"))
+    application.add_handler(CallbackQueryHandler(handle_catchup_callback, pattern=r"^catchup_"))
     application.add_handler(CallbackQueryHandler(handle_plan_help_callback, pattern=r"^planhelp_"))
+    application.add_handler(CallbackQueryHandler(handle_support_callback, pattern=r"^(ask_support|support_cancel)$"))
+    application.add_handler(CallbackQueryHandler(handle_forget_callback, pattern=r"^forget_"))
     application.add_handler(CallbackQueryHandler(handle_lesson_callback, pattern=r"^lesson_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_continue_callback, pattern=r"^continue_"))
     application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^admin_"))
 
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("problems", problems_command))
-    application.add_handler(CommandHandler("user", user_command))
-    application.add_handler(CommandHandler("pause", pause_command))
-    application.add_handler(CommandHandler("resume", resume_command))
-    application.add_handler(CommandHandler("reset", reset_command))
-    application.add_handler(CommandHandler("broadcast", broadcast_command))
-
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_reply))
 
     job_queue = application.job_queue
     job_queue.run_daily(daily_send_job, time=dtime(hour=DAILY_SEND_HOUR, minute=0, tzinfo=ALMATY_TZ))
     midday_hour = DAILY_SEND_HOUR + max(1, (DEADLINE_HOUR - DAILY_SEND_HOUR) // 2)
     job_queue.run_daily(midday_check_job, time=dtime(hour=min(midday_hour, 23), minute=0, tzinfo=ALMATY_TZ))
-    reminder_hour = max(0, DEADLINE_HOUR - 2)
-    job_queue.run_daily(reminder_job, time=dtime(hour=reminder_hour, minute=0, tzinfo=ALMATY_TZ))
+    job_queue.run_daily(reminder_job, time=dtime(hour=max(0, DEADLINE_HOUR - 2), minute=0, tzinfo=ALMATY_TZ))
     job_queue.run_daily(final_reminder_job, time=dtime(hour=max(0, DEADLINE_HOUR - 1), minute=30, tzinfo=ALMATY_TZ))
     job_queue.run_daily(deadline_advance_job, time=dtime(hour=DEADLINE_HOUR, minute=0, tzinfo=ALMATY_TZ))
+    job_queue.run_daily(admin_digest_job, time=dtime(hour=ADMIN_DIGEST_HOUR, minute=30, tzinfo=ALMATY_TZ))
+    return application
 
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN орнатылмаған! .env файлын тексер.")
+
+    db.init_db()
+    application = build_application(BOT_TOKEN)
     threading.Thread(target=run_health_server, daemon=True).start()
-
-    logger.info("TARTIP Bot V3 іске қосылды...")
+    logger.info("TARTIP Bot V4 іске қосылды...")
     application.run_polling()
 
 

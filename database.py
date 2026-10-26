@@ -1,20 +1,50 @@
 """
-Дерек қоры (SQLite) — TARTIP V3.
-Жаңалықтары:
-- users кестесіне category өрісі қосылды
-- habit_checkins кестесі: әр әдет (habit) бойынша жеке белгіленеді
-- Күн автоматты түрде дедлайн уақытында алға жылжиды (батырма арқылы емес)
-"""
-import sqlite3
-from datetime import datetime, date, timedelta, timezone
+Дерек қоры (SQLite) — TARTIP V4.
 
-DB_PATH = "tartip.db"
+V3-тен өзгерістер:
+- users кестесіне клиент профилі қосылды (ояну/жату уақыты, ас саны, жаттығу орны,
+  шектеулер, денсаулық белгісі, ересек белгісі). Ескі дерек жоғалмайды: бағандар
+  init_db() кезінде автоматты қосылады (миграция).
+- habit_checkins.mode: 'full' (толық), 'light' (жеңіл нұсқа), 'catchup' (кешегіні жабу)
+- streak енді күнге негізделіп есептеледі (күндер қатарынан орындалған), ескі сан қалмайды
+- барлық күндер Asia/Almaty бойынша (сервер уақытына тәуелді емес)
+- DB_PATH айнымалысы арқылы дерекқор орнын таңдауға болады (Railway Volume үшін)
+"""
+import os
+import sqlite3
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+DB_PATH = os.environ.get("DB_PATH", "tartip.db")
+TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Almaty"))
+TOTAL_DAYS = 28
+
+# Клиент профилінің өрістері (users кестесіне миграциямен қосылады)
+USER_EXTRA_COLUMNS = {
+    "wake_time": "TEXT",
+    "bed_time": "TEXT",
+    "meals": "INTEGER",
+    "place": "TEXT",
+    "restrictions": "TEXT",
+    "health_flag": "TEXT",   # 'yes' | 'no' | 'skip' — тек белгі, диагноз сақталмайды
+    "adult": "TEXT",         # 'yes' | 'no'
+    "awaiting": "TEXT",      # 'support' | 'review_N' | 'finish_sent' | ''
+}
+UPDATABLE = set(USER_EXTRA_COLUMNS) | {"full_name", "goal", "goal_why", "category", "is_active", "paused"}
+
+
+def today() -> date:
+    return datetime.now(TZ).date()
 
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _columns(cur, table: str) -> set:
+    return {row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def init_db():
@@ -49,19 +79,41 @@ def init_db():
             UNIQUE(telegram_id, day, habit_id)
         )
     """)
+    # Миграция: ескі дерекқорға жаңа бағандарды қосу (бар дерек сақталады)
+    user_cols = _columns(cur, "users")
+    for col, col_type in USER_EXTRA_COLUMNS.items():
+        if col not in user_cols:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+    if "mode" not in _columns(cur, "habit_checkins"):
+        cur.execute("ALTER TABLE habit_checkins ADD COLUMN mode TEXT DEFAULT 'full'")
     conn.commit()
     conn.close()
 
 
-def add_user(telegram_id: int, username: str, full_name: str, category: str, goal: str, goal_why: str = ""):
+def add_user(telegram_id: int, username: str, full_name: str, category: str, goal: str,
+             goal_why: str = "", profile: dict = None):
     conn = get_connection()
     cur = conn.cursor()
-    today = date.today().isoformat()
+    day_str = today().isoformat()
     cur.execute("""
         INSERT OR IGNORE INTO users
-        (telegram_id, username, full_name, category, goal, goal_why, start_date, current_day, last_advance_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-    """, (telegram_id, username, full_name, category, goal, goal_why, today, today))
+        (telegram_id, username, full_name, category, goal, goal_why, start_date, current_day, last_advance_date, awaiting)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, '')
+    """, (telegram_id, username, full_name, category, goal, goal_why, day_str, day_str))
+    conn.commit()
+    conn.close()
+    if profile:
+        update_user(telegram_id, **profile)
+
+
+def update_user(telegram_id: int, **fields):
+    """Тек рұқсат етілген өрістерді жаңартады."""
+    clean = {k: v for k, v in fields.items() if k in UPDATABLE}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    conn = get_connection()
+    conn.execute(f"UPDATE users SET {sets} WHERE telegram_id = ?", (*clean.values(), telegram_id))
     conn.commit()
     conn.close()
 
@@ -95,149 +147,167 @@ def get_all_users():
 
 def set_paused(telegram_id: int, paused: bool):
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET paused = ? WHERE telegram_id = ?", (1 if paused else 0, telegram_id))
+    conn.execute("UPDATE users SET paused = ? WHERE telegram_id = ?", (1 if paused else 0, telegram_id))
     conn.commit()
     conn.close()
 
 
-def delete_user(telegram_id: int):
-    """Клиентті ТОЛЫҚ ұмытады — профиль де, тапсырма тарихы да өшеді.
-    Сынау кезінде /start ағынын қайта бастан өту үшін, немесе клиент
-    'деректерімді өшір' деп сұраса қолданылады."""
+def set_awaiting(telegram_id: int, value: str):
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM habit_checkins WHERE telegram_id = ?", (telegram_id,))
-    cur.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+    conn.execute("UPDATE users SET awaiting = ? WHERE telegram_id = ?", (value or "", telegram_id))
+    conn.commit()
+    conn.close()
+
+
+def clear_awaiting_prefixes(telegram_id: int, prefixes=("support", "review_")):
+    """Таңертең ескі «күтіп тұрған жауапты» тазалайды, сонда ол кездейсоқ есепке кетпейді."""
+    user = get_user(telegram_id)
+    if not user:
+        return
+    aw = user.get("awaiting") or ""
+    if any(aw.startswith(p) for p in prefixes):
+        set_awaiting(telegram_id, "")
+
+
+def delete_user(telegram_id: int):
+    """Клиентті ТОЛЫҚ ұмытады — профиль де, тапсырма тарихы да өшеді."""
+    conn = get_connection()
+    conn.execute("DELETE FROM habit_checkins WHERE telegram_id = ?", (telegram_id,))
+    conn.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
     conn.commit()
     conn.close()
 
 
 def reset_progress(telegram_id: int):
     conn = get_connection()
-    cur = conn.cursor()
-    today = date.today().isoformat()
-    cur.execute("""
-        UPDATE users SET current_day = 1, streak = 0, last_checkin_date = NULL, last_advance_date = ?
+    conn.execute("""
+        UPDATE users SET current_day = 1, streak = 0, last_checkin_date = NULL,
+        last_advance_date = ?, awaiting = ''
         WHERE telegram_id = ?
-    """, (today, telegram_id))
-    cur.execute("DELETE FROM habit_checkins WHERE telegram_id = ?", (telegram_id,))
+    """, (today().isoformat(), telegram_id))
+    conn.execute("DELETE FROM habit_checkins WHERE telegram_id = ?", (telegram_id,))
     conn.commit()
     conn.close()
 
 
-def record_habit_checkin(telegram_id: int, day: int, habit_id: str, proof_file_id: str = None, text_response: str = None):
-    """Бір әдетті (habit) сол күнге белгілейді. Қайталап шақырса, үстінен жазады (қате болмайды)."""
+# ---------- Күндік миссия белгілері ----------
+
+def compute_streak(done_days, current_day: int) -> int:
+    """Орындалған күндердің қатарын санайды. Бүгін әлі орындалмаса, кешегіден санайды,
+    сондықтан күн әлі аяқталмаған кезде қатар үзілмейді."""
+    done = set(done_days)
+    day = current_day if current_day in done else current_day - 1
+    streak = 0
+    while day >= 1 and day in done:
+        streak += 1
+        day -= 1
+    return streak
+
+
+def get_done_days(telegram_id: int) -> dict:
+    """{күн: mode} — миссиясы орындалған күндер."""
     conn = get_connection()
-    cur = conn.cursor()
-    today = date.today().isoformat()
-    cur.execute("""
-        INSERT INTO habit_checkins (telegram_id, day, habit_id, checkin_date, proof_file_id, text_response)
-        VALUES (?, ?, ?, ?, ?, ?)
+    rows = conn.execute(
+        "SELECT day, mode FROM habit_checkins WHERE telegram_id = ? AND habit_id = 'daily_plan'",
+        (telegram_id,),
+    ).fetchall()
+    conn.close()
+    return {r["day"]: (r["mode"] or "full") for r in rows}
+
+
+def get_streak(telegram_id: int, current_day: int) -> int:
+    return compute_streak(get_done_days(telegram_id).keys(), current_day)
+
+
+def record_checkin(telegram_id: int, day: int, habit_id: str = "daily_plan",
+                   proof_file_id: str = None, text_response: str = None, mode: str = "full") -> int:
+    """Күнді белгілейді. Қайталап шақырса, үстінен жазады; толық нұсқа жеңіл нұсқаға түспейді,
+    ал бұрынғы мәтін/фото жоғалмайды."""
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO habit_checkins (telegram_id, day, habit_id, checkin_date, proof_file_id, text_response, mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(telegram_id, day, habit_id) DO UPDATE SET
-            checkin_date=excluded.checkin_date,
-            proof_file_id=excluded.proof_file_id,
-            text_response=excluded.text_response
-    """, (telegram_id, day, habit_id, today, proof_file_id, text_response))
-
-    user_row = cur.execute("SELECT streak, last_checkin_date FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-    last = user_row["last_checkin_date"]
-    cur_streak = user_row["streak"]
-    new_streak = cur_streak
-    if last != today:
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
-        new_streak = (cur_streak + 1) if last == yesterday else 1
-    cur.execute("UPDATE users SET streak = ?, last_checkin_date = ? WHERE telegram_id = ?",
-                (new_streak, today, telegram_id))
+            checkin_date = excluded.checkin_date,
+            proof_file_id = COALESCE(excluded.proof_file_id, habit_checkins.proof_file_id),
+            text_response = COALESCE(excluded.text_response, habit_checkins.text_response),
+            mode = CASE
+                WHEN excluded.mode = 'full' THEN 'full'
+                WHEN habit_checkins.mode = 'full' THEN 'full'
+                ELSE excluded.mode
+            END
+    """, (telegram_id, day, habit_id, today().isoformat(), proof_file_id, text_response, mode))
     conn.commit()
     conn.close()
-    return new_streak
+
+    streak = 0
+    if habit_id == "daily_plan":
+        user = get_user(telegram_id)
+        if user:
+            streak = compute_streak(get_done_days(telegram_id).keys(), user["current_day"])
+            conn = get_connection()
+            conn.execute("UPDATE users SET streak = ?, last_checkin_date = ? WHERE telegram_id = ?",
+                         (streak, today().isoformat(), telegram_id))
+            conn.commit()
+            conn.close()
+    return streak
 
 
-def get_habit_checkin(telegram_id: int, day: int, habit_id: str):
+def get_checkin(telegram_id: int, day: int, habit_id: str = "daily_plan"):
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM habit_checkins WHERE telegram_id = ? AND day = ? AND habit_id = ?
-    """, (telegram_id, day, habit_id))
-    row = cur.fetchone()
+    row = conn.execute(
+        "SELECT * FROM habit_checkins WHERE telegram_id = ? AND day = ? AND habit_id = ?",
+        (telegram_id, day, habit_id),
+    ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def get_completed_habits_today(telegram_id: int, day: int):
+def get_text_responses(telegram_id: int) -> list:
+    """Клиенттің миссияларға жазған жауаптары (күн ретімен)."""
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT habit_id FROM habit_checkins WHERE telegram_id = ? AND day = ?
-    """, (telegram_id, day))
-    rows = cur.fetchall()
+    rows = conn.execute("""
+        SELECT day, text_response, mode, checkin_date FROM habit_checkins
+        WHERE telegram_id = ? AND habit_id = 'daily_plan' AND text_response IS NOT NULL AND text_response != ''
+        ORDER BY day
+    """, (telegram_id,)).fetchall()
     conn.close()
-    return [r["habit_id"] for r in rows]
+    return [dict(r) for r in rows]
 
+
+def get_reviews(telegram_id: int) -> list:
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT day, habit_id, text_response FROM habit_checkins
+        WHERE telegram_id = ? AND habit_id LIKE 'review_%' ORDER BY day
+    """, (telegram_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------- Күн жылжыту ----------
 
 def advance_day(telegram_id: int):
     conn = get_connection()
-    cur = conn.cursor()
-    today = date.today().isoformat()
-    cur.execute("""
+    conn.execute("""
         UPDATE users SET current_day = current_day + 1, last_advance_date = ?
         WHERE telegram_id = ?
-    """, (today, telegram_id))
+    """, (today().isoformat(), telegram_id))
     conn.commit()
     conn.close()
 
 
 def needs_advance_today(user: dict) -> bool:
-    today = date.today().isoformat()
-    return user["last_advance_date"] != today
-
-
-def get_inactive_users(days_threshold: int = 2):
-    conn = get_connection()
-    cur = conn.cursor()
-    threshold_date = (date.today() - timedelta(days=days_threshold)).isoformat()
-    cur.execute("""
-        SELECT * FROM users
-        WHERE is_active = 1 AND paused = 0
-        AND (last_checkin_date IS NULL OR last_checkin_date < ?)
-    """, (threshold_date,))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def categorize_users():
-    users = get_all_active_users()
-    green, yellow, red = [], [], []
-    today = date.today()
-
-    for u in users:
-        if not u["last_checkin_date"]:
-            red.append(u)
-            continue
-        last_date = date.fromisoformat(u["last_checkin_date"])
-        days_gone = (today - last_date).days
-        if days_gone <= 1:
-            green.append(u)
-        elif days_gone <= 2:
-            yellow.append(u)
-        else:
-            red.append(u)
-
-    return {"green": green, "yellow": yellow, "red": red}
+    return user["last_advance_date"] != today().isoformat()
 
 
 def get_stats():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as c FROM users WHERE is_active = 1")
-    active = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) as c FROM users")
-    total = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) as c FROM users WHERE paused = 1")
-    paused = cur.fetchone()["c"]
-    cur.execute("SELECT AVG(streak) as avg_streak FROM users WHERE is_active = 1")
-    avg_streak = cur.fetchone()["avg_streak"] or 0
-    conn.close()
-    return {"active": active, "total": total, "paused": paused, "avg_streak": round(avg_streak, 1)}
+    users = get_all_users()
+    active = [u for u in users if u["is_active"]]
+    streaks = [get_streak(u["telegram_id"], u["current_day"]) for u in active]
+    return {
+        "active": len(active),
+        "total": len(users),
+        "paused": sum(1 for u in users if u["paused"]),
+        "avg_streak": round(sum(streaks) / len(streaks), 1) if streaks else 0,
+    }
